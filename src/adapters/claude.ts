@@ -1,22 +1,23 @@
 // Claude.ai site adapter.
 //
-// Lifted from the Miyo desktop app's previous claude-adapter. Cookies
-// are attached automatically by the browser when fetching from the
-// extension's host_permissions context.
-//
-// Claude's `/chat_conversations` endpoint returns the full list with no
-// server-side pagination — we sort and slice locally. The list payload
-// is ~100B per row even for thousands of conversations, so this is
-// cheap to refetch.
+// Same pattern as chatgpt.ts: the adapter owns its data shape and
+// renders to markdown. It happens to be chat-shaped, so it uses
+// framework/chat.ts; a future Claude-Projects or Claude-Artifacts
+// adapter (or any non-chat site) would render differently.
 
 import type {
-  ConversationListPage,
-  RawConversation,
-  RawMessage,
+  ItemListPage,
+  RenderedItem,
   SiteAdapter,
   SiteSession,
 } from '../framework/types.js';
 import { classifyHttp } from '../framework/rate-limit.js';
+import {
+  renderChatConversationMarkdown,
+  type ChatConversation,
+  type ChatMessage,
+} from '../framework/chat.js';
+import { makeDatePrefixedFilename } from '../framework/filename.js';
 
 interface ClaudeOrgEntry {
   uuid: string;
@@ -94,14 +95,26 @@ function messageText(m: ClaudeFullConversation['chat_messages'][number]): string
   return m.text ?? '';
 }
 
-function toMessages(full: ClaudeFullConversation): RawMessage[] {
+function toMessages(full: ClaudeFullConversation): ChatMessage[] {
   return full.chat_messages
-    .map<RawMessage>((m) => ({
+    .map<ChatMessage>((m) => ({
       role: m.sender === 'human' ? 'user' : 'assistant',
       text: messageText(m).trim(),
       created_at: m.created_at,
     }))
     .filter((m) => m.text);
+}
+
+function toConversation(full: ClaudeFullConversation): ChatConversation {
+  return {
+    site: 'claude',
+    conversation_id: full.uuid,
+    title: full.name,
+    url: `https://claude.ai/chat/${full.uuid}`,
+    created_at: full.created_at,
+    updated_at: full.updated_at,
+    messages: toMessages(full),
+  };
 }
 
 export const claudeAdapter: SiteAdapter = {
@@ -127,37 +140,36 @@ export const claudeAdapter: SiteAdapter = {
     }
   },
 
-  async listConversations(cursor: string | null): Promise<ConversationListPage> {
+  async listItems(cursor: string | null): Promise<ItemListPage> {
     const orgId = await discoverOrgId();
     const offset = cursor ? Number.parseInt(cursor, 10) : 0;
+    // Claude's /chat_conversations endpoint returns the full list with
+    // no server-side pagination — sort and slice locally. The list
+    // payload is ~100B per row even for thousands of conversations.
     const list = await claudeApi<ClaudeListItem[]>(
       `/api/organizations/${orgId}/chat_conversations`
     );
     const sorted = list.slice().sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
     const slice = sorted.slice(offset, offset + PAGE_SIZE);
-    const items = slice.map((it) => ({
-      id: it.uuid,
-      title: it.name || 'Untitled',
-      updated_at: it.updated_at,
-    }));
+    const items = slice.map((it) => ({ id: it.uuid, updated_at: it.updated_at }));
     const next_offset = offset + PAGE_SIZE;
     const next_cursor = next_offset >= sorted.length ? null : String(next_offset);
     return { items, next_cursor, total: sorted.length };
   },
 
-  async fetchConversation(id: string): Promise<RawConversation> {
+  async fetchItem(id: string): Promise<RenderedItem> {
     const orgId = await discoverOrgId();
     const full = await claudeApi<ClaudeFullConversation>(
       `/api/organizations/${orgId}/chat_conversations/${id}?tree=True&rendering_mode=raw`
     );
+    const conv = toConversation(full);
     return {
-      site: 'claude',
-      conversation_id: full.uuid,
-      title: full.name,
-      url: `https://claude.ai/chat/${full.uuid}`,
-      created_at: full.created_at,
-      updated_at: full.updated_at,
-      messages: toMessages(full),
+      filename: makeDatePrefixedFilename({
+        id: conv.conversation_id,
+        title: conv.title,
+        createdAt: conv.created_at,
+      }),
+      body: renderChatConversationMarkdown(conv),
     };
   },
 };

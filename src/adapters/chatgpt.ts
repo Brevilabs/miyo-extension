@@ -1,28 +1,25 @@
 // ChatGPT site adapter.
 //
-// Lifted from the Miyo desktop app's previous chatgpt-adapter, adapted
-// to run inside a browser extension. Two changes from the desktop
-// version:
-//
-//   1. `fetch` instead of `session.fetch`. Cookies are attached
-//      automatically because the extension runs in the user's logged-in
-//      browser session — same fingerprint as the user using ChatGPT in
-//      another tab.
-//
-//   2. Access-token cache lives in `chrome.storage.session` instead of
-//      a `WeakMap<Session, …>`. The cache survives a service-worker
-//      restart inside the same browser session, which means a long
-//      sync interrupted by SW kill does not need to re-mint the JWT
-//      on resume.
+// The adapter owns its data shape (chat conversations from
+// `/backend-api/conversation/{id}`) and its markdown rendering. It
+// uses framework helpers for the parts that should stay consistent
+// across adapters — filename derivation and chat-style rendering —
+// but it is not required to. Future adapters whose data is not chat
+// can ignore framework/chat.ts and emit any markdown layout they want.
 
 import type {
-  ConversationListPage,
-  RawConversation,
-  RawMessage,
+  ItemListPage,
+  RenderedItem,
   SiteAdapter,
   SiteSession,
 } from '../framework/types.js';
 import { classifyHttp, FatalError } from '../framework/rate-limit.js';
+import {
+  renderChatConversationMarkdown,
+  type ChatConversation,
+  type ChatMessage,
+} from '../framework/chat.js';
+import { makeDatePrefixedFilename } from '../framework/filename.js';
 
 type ChatgptTime = number | string | null | undefined;
 
@@ -119,8 +116,6 @@ async function fetchAccessToken(): Promise<CachedToken> {
   const json = (await res.json()) as { accessToken?: string; user?: { email?: string } };
   if (!json.accessToken) {
     await setCachedToken(null);
-    // Treat missing accessToken (typically signed-out / cookie expired)
-    // as a 401 — same downstream handling.
     throw new FatalError('No accessToken in /api/auth/session', 401);
   }
 
@@ -164,7 +159,7 @@ function nodeText(node: ChatgptMessageNode): string {
   return '';
 }
 
-function flatten(full: ChatgptFullConversation): RawMessage[] {
+function flatten(full: ChatgptFullConversation): ChatMessage[] {
   const chain: ChatgptMessageNode[] = [];
   let cursor: string | null = full.current_node;
   while (cursor) {
@@ -174,7 +169,7 @@ function flatten(full: ChatgptFullConversation): RawMessage[] {
     cursor = node.parent;
   }
   chain.reverse();
-  const out: RawMessage[] = [];
+  const out: ChatMessage[] = [];
   for (const node of chain) {
     const msg = node.message;
     if (!msg) continue;
@@ -188,6 +183,18 @@ function flatten(full: ChatgptFullConversation): RawMessage[] {
     });
   }
   return out;
+}
+
+function toConversation(full: ChatgptFullConversation): ChatConversation {
+  return {
+    site: 'chatgpt',
+    conversation_id: full.conversation_id,
+    title: full.title,
+    url: `https://chatgpt.com/c/${full.conversation_id}`,
+    created_at: toIsoString(full.create_time),
+    updated_at: toIsoString(full.update_time),
+    messages: flatten(full),
+  };
 }
 
 export const chatgptAdapter: SiteAdapter = {
@@ -204,7 +211,7 @@ export const chatgptAdapter: SiteAdapter = {
     }
   },
 
-  async listConversations(cursor: string | null): Promise<ConversationListPage> {
+  async listItems(cursor: string | null): Promise<ItemListPage> {
     const offset = cursor ? Number.parseInt(cursor, 10) : 0;
     const t = await fetchAccessToken();
     const list = await chatgptApi<{ items: ChatgptListItem[]; total?: number }>(
@@ -215,13 +222,7 @@ export const chatgptAdapter: SiteAdapter = {
       if (!it.id) return [];
       const iso = toIsoString(it.update_time);
       if (!iso) return [];
-      return [
-        {
-          id: it.id,
-          title: it.title || 'Untitled',
-          updated_at: iso,
-        },
-      ];
+      return [{ id: it.id, updated_at: iso }];
     });
     const total = typeof list.total === 'number' ? list.total : null;
     const next_offset = offset + PAGE_SIZE;
@@ -232,20 +233,17 @@ export const chatgptAdapter: SiteAdapter = {
     return { items, next_cursor, total };
   },
 
-  async fetchConversation(id: string): Promise<RawConversation> {
+  async fetchItem(id: string): Promise<RenderedItem> {
     const t = await fetchAccessToken();
-    const full = await chatgptApi<ChatgptFullConversation>(
-      t.value,
-      `/conversation/${id}`
-    );
+    const full = await chatgptApi<ChatgptFullConversation>(t.value, `/conversation/${id}`);
+    const conv = toConversation(full);
     return {
-      site: 'chatgpt',
-      conversation_id: full.conversation_id,
-      title: full.title,
-      url: `https://chatgpt.com/c/${full.conversation_id}`,
-      created_at: toIsoString(full.create_time),
-      updated_at: toIsoString(full.update_time),
-      messages: flatten(full),
+      filename: makeDatePrefixedFilename({
+        id: conv.conversation_id,
+        title: conv.title,
+        createdAt: conv.created_at,
+      }),
+      body: renderChatConversationMarkdown(conv),
     };
   },
 };

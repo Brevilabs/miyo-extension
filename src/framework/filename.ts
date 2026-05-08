@@ -1,13 +1,9 @@
-// `2026-04-28 Counting unique license keys (abc12345).md`
+// Filename utilities shared across adapters.
 //
-// Three-part filename, kept identical to the Miyo desktop app's
-// pre-rebuild convention so existing libraries stay coherent:
-//   1. Date prefix from `created_at`. Stable — does not shift on every
-//      reply the way `updated_at` would, so a renamed file does not
-//      get its date shifted around.
-//   2. Sanitized title, capped at 80 characters.
-//   3. 8-char alphanumeric suffix from the conversation_id, so two
-//      same-day same-title conversations don't collide.
+// Adapters call these to produce stable, filesystem-safe filenames.
+// Stability is the contract: the same item must always produce the
+// same filename so re-fetches overwrite the existing file (idempotent
+// writes) and title-change detection (rename old → new) works.
 
 // eslint-disable-next-line no-control-regex
 const FILENAME_UNSAFE = /[/\\:*?"<>|\x00-\x1f]/g;
@@ -24,13 +20,24 @@ export function sanitizeTitleForFilename(title: string): string {
   return cleaned.length > TITLE_MAX ? cleaned.slice(0, TITLE_MAX).trim() : cleaned;
 }
 
-export function makeConversationFilename(args: {
+export function shortenId(id: string, length = 8): string {
+  return id.replace(/[^a-zA-Z0-9]/g, '').slice(0, length) || 'id';
+}
+
+// `2026-04-28 Counting unique license keys (abc12345).md`
+//
+// Three-part filename adopted from the Miyo desktop app's pre-rebuild
+// convention so existing libraries stay coherent. Adapters whose data
+// has a natural date are encouraged to use this helper for
+// consistency, but they are not required to — non-chat adapters with
+// different natural shapes can produce their own filenames.
+export function makeDatePrefixedFilename(args: {
   id: string;
   title: string;
   createdAt: string | null;
 }): string {
   const datePart = args.createdAt ? args.createdAt.slice(0, 10) : 'undated';
   const titlePart = sanitizeTitleForFilename(args.title);
-  const shortId = args.id.replace(/[^a-zA-Z0-9]/g, '').slice(0, 8) || 'id';
+  const shortId = shortenId(args.id);
   return `${datePart} ${titlePart} (${shortId}).md`;
 }

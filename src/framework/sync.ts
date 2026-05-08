@@ -5,25 +5,30 @@
 // concerns (folder picker, permission grant); by the time we get here
 // the library handle exists and we have readwrite permission.
 //
+// The framework is content-agnostic: it asks the adapter for a list
+// of item refs, asks the adapter to render each item to a filename +
+// body, and writes the body to disk. It does not know whether the
+// items are chat conversations, documents, bookmarks, or anything
+// else.
+//
 // Correctness invariants:
 //
 //   1. The cursor (last successfully synced `updated_at`) only
 //      advances at the end of a fully-completed run. A partial run
 //      that gets interrupted leaves the cursor unchanged, and the
 //      next click resumes via `SyncProgress.pending_ids` — we do not
-//      re-fetch conversations we already wrote.
+//      re-fetch items we already wrote.
 //
 //   2. SyncProgress is persisted after every individual write. A
 //      service-worker kill at any point loses at most one in-flight
 //      fetch; everything written to disk is reflected in
-//      chrome.storage.local before the next conversation starts.
+//      chrome.storage.local before the next item starts.
 //
-//   3. File writes are idempotent. Same conversation_id always maps
-//      to a deterministic filename (date prefix + sanitized title +
-//      shortId). Re-fetching a conversation overwrites the existing
-//      file. Title changes trigger a write-then-delete rename so a
-//      crash between the two leaves a harmless duplicate, never a
-//      missing file.
+//   3. File writes are idempotent. Adapter contract guarantees the
+//      same item id produces a deterministic filename. Re-fetches
+//      overwrite the existing file. Filename changes (title rename,
+//      etc.) trigger a write-then-delete rename so a crash between
+//      the two leaves a harmless duplicate, never a missing file.
 //
 //   4. Listing is newest-first; the first item with
 //      `updated_at <= cursor` lets us terminate paging early. Without
@@ -34,14 +39,11 @@
 //      signed-out. Subsequent calls would all fail the same way and
 //      the user must re-sign-in in their browser tab.
 //
-// The orchestrator collects per-conversation errors but never aborts
-// the run on them. A 429 from a single fetch surfaces as one
-// "1 conversation failed" line; the rest of the run completes.
+// The orchestrator collects per-item errors but never aborts the run
+// on them. A 429 from a single fetch surfaces as one "1 item failed"
+// line; the rest of the run completes.
 
-import { FatalError } from './rate-limit.js';
-import { paced } from './rate-limit.js';
-import { renderConversationMarkdown } from './markdown.js';
-import { makeConversationFilename } from './filename.js';
+import { FatalError, paced } from './rate-limit.js';
 import {
   getSiteState,
   patchSiteState,
@@ -55,9 +57,9 @@ import {
 } from './storage.js';
 import type { SiteAdapter, SyncProgress } from './types.js';
 
-// Cap a single Sync click. ChatGPT users with multi-thousand-conversation
-// histories see "Continue sync" on the next click rather than chewing
-// the SW for an hour.
+// Cap a single Sync click. Multi-thousand-item histories see
+// "Continue sync" on the next click rather than chewing the SW for
+// an hour.
 const MAX_PER_RUN = 1000;
 
 export interface SyncCallbacks {
@@ -112,9 +114,7 @@ export async function runSync(
       // Refill pending_ids from the next list page when empty.
       if (progress.pending_ids.length === 0) {
         if (progress.list_exhausted) break;
-        const page = await paced(adapter.id, () =>
-          adapter.listConversations(progress.list_cursor)
-        );
+        const page = await paced(adapter.id, () => adapter.listItems(progress.list_cursor));
         if (progress.total === null && page.total !== null) progress.total = page.total;
 
         let hitCursor = false;
@@ -132,8 +132,6 @@ export async function runSync(
         progress.list_cursor = page.next_cursor;
         await setSyncProgress(adapter.id, progress);
 
-        // Empty page after filtering — either we're done, or the
-        // next page might still have new items.
         if (progress.pending_ids.length === 0) {
           if (progress.list_exhausted) break;
           continue;
@@ -142,25 +140,20 @@ export async function runSync(
 
       const id = progress.pending_ids.shift()!;
       try {
-        const conv = await paced(adapter.id, () => adapter.fetchConversation(id));
-        const newFilename = makeConversationFilename({
-          id: conv.conversation_id,
-          title: conv.title,
-          createdAt: conv.created_at,
-        });
+        const rendered = await paced(adapter.id, () => adapter.fetchItem(id));
         await writeMarkdown({
           root,
           subdir: adapter.subdir,
-          filename: newFilename,
-          oldFilename: filenames[conv.conversation_id] ?? null,
-          body: renderConversationMarkdown(conv),
+          filename: rendered.filename,
+          oldFilename: filenames[id] ?? null,
+          body: rendered.body,
         });
 
-        filenames[conv.conversation_id] = newFilename;
+        filenames[id] = rendered.filename;
         progress.completed += 1;
 
-        // Persist after every write so a SW restart loses at most
-        // the in-flight fetch, never a written file's bookkeeping.
+        // Persist after every write so a SW restart loses at most the
+        // in-flight fetch, never bookkeeping for files already on disk.
         await patchSiteState(adapter.id, { filenames });
         await setSyncProgress(adapter.id, progress);
         callbacks.onProgress({ completed: progress.completed, total: progress.total });
@@ -169,7 +162,7 @@ export async function runSync(
           return finalizeAsSignedOut();
         }
         const message = err instanceof Error ? err.message : String(err);
-        progress.errors.push({ conversation_id: id, message });
+        progress.errors.push({ item_id: id, message });
         await setSyncProgress(adapter.id, progress);
       }
     }
@@ -186,7 +179,7 @@ export async function runSync(
       last_sync_at: Date.now(),
       last_sync_error:
         progress.errors.length > 0
-          ? `${progress.errors.length} conversation${progress.errors.length === 1 ? '' : 's'} failed`
+          ? `${progress.errors.length} item${progress.errors.length === 1 ? '' : 's'} failed`
           : null,
     });
     await setSyncProgress(adapter.id, null);
