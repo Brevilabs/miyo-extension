@@ -1,6 +1,7 @@
 // Cross-cutting types shared by the framework, adapters, and UI.
 
 import type { ChatConversation } from './chat.js';
+import type { TransportSnapshot } from './transports/index.js';
 
 export type SiteId = string;
 
@@ -28,13 +29,11 @@ export interface ItemListPage {
 }
 
 // What a custom adapter returns from fetchItem. The framework forwards
-// `body` to Miyo with the given `filename`; Miyo writes it under the
-// connector's destination directory.
+// `body` to the active transport with the given `filename`.
 //
 // `filename` MUST be deterministic: the same item id with the same
 // content state must always produce the same filename, so re-deliveries
-// overwrite cleanly and Miyo can detect filename changes (title rename,
-// etc.) by diffing against its persisted filenames map.
+// overwrite cleanly.
 export interface RenderedItem {
   filename: string;
   body: string;
@@ -45,9 +44,9 @@ interface BaseSiteAdapter {
   id: SiteId;
   label: string;
 
-  // Subdirectory hint used when documenting where Miyo writes files.
-  // Conventionally `<id>/`. Miyo's connector destination_path takes
-  // precedence at write time.
+  // Subdirectory hint used by the downloads transport
+  // (Downloads/Miyo/<subdir>/...) and as a documentation aid for
+  // Miyo's per-source destination convention. Conventionally `<id>/`.
   subdir: string;
 
   // Returns user identity if signed in. Never throws on a logged-out
@@ -62,9 +61,8 @@ interface BaseSiteAdapter {
 
 // Chat-shaped adapter. Submits a normalized ChatConversation; the
 // framework derives the filename and renders the markdown. This keeps
-// chat output uniform across every chat provider (ChatGPT, Claude,
-// future Gemini/Grok/etc.) so a Miyo library reads as one corpus
-// rather than per-vendor formats.
+// chat output uniform across every chat provider so a Miyo library
+// reads as one corpus rather than per-vendor formats.
 export interface ChatSiteAdapter extends BaseSiteAdapter {
   kind: 'chat';
   fetchConversation(id: string): Promise<ChatConversation>;
@@ -72,9 +70,7 @@ export interface ChatSiteAdapter extends BaseSiteAdapter {
 
 // Custom adapter. Owns its own filename and markdown body. Used for
 // sites whose data is not chat-shaped (notes, bookmarks, documents,
-// emails, RSS items). The adapter MAY use the framework helpers in
-// `framework/filename.ts` and `framework/markdown.ts` for consistency,
-// but is not required to.
+// emails, RSS items).
 export interface CustomSiteAdapter extends BaseSiteAdapter {
   kind: 'custom';
   fetchItem(id: string): Promise<RenderedItem>;
@@ -90,11 +86,7 @@ export interface SiteState {
   // Null before the first successful sync.
   cursor_updated_at: string | null;
 
-  // Map from item id → last-delivered filename. Lets us tell Miyo
-  // about filename changes (the orchestrator passes the prior
-  // filename in the post payload — though as of v1 Miyo derives
-  // renames from `stable_id` + new filename rather than needing the
-  // prior name explicitly).
+  // Map from item id → last-delivered filename.
   filenames: Record<string, string>;
 
   // Last sign-in probe result, cached for popup display so it doesn't
@@ -109,8 +101,7 @@ export interface SiteState {
 
 // In-progress sync state. Stored in chrome.storage.local under
 // `progress:<siteId>` and cleared once the sync finishes or
-// permanently aborts. Persisting this means a service-worker kill
-// mid-sync resumes from the right spot on the next user click.
+// permanently aborts.
 export interface SyncProgress {
   started_at: number;
   total: number | null;
@@ -121,13 +112,8 @@ export interface SyncProgress {
   list_exhausted: boolean;
 }
 
-// Connection to the Miyo desktop app's local HTTP receiver.
-export type MiyoConnection =
-  | { state: 'connected'; version: string | null }
-  | { state: 'unreachable' };
-
 export interface PopupSnapshot {
-  miyo: MiyoConnection;
+  transports: TransportSnapshot;
   sites: Array<{
     id: SiteId;
     label: string;

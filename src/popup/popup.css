@@ -115,6 +115,23 @@ button.primary {
   justify-content: space-between;
   gap: 8px;
 }
+.banner .row.sub {
+  margin-top: 4px;
+  font-size: 11px;
+}
+.banner code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--bg);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+.banner a {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 12px;
+}
+.banner a:hover { text-decoration: underline; }
 
 footer {
   margin-top: 10px;

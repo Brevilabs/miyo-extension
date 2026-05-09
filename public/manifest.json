@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Miyo",
   "short_name": "Miyo",
-  "version": "0.3.0",
-  "description": "Capture your ChatGPT and Claude conversations into your local Miyo library. User-initiated sync, files stay on your machine.",
+  "version": "0.4.0",
+  "description": "Capture your ChatGPT and Claude conversations as local markdown. Works standalone — saves to Downloads. With Miyo installed, files land in your library and become searchable.",
   "icons": {
     "16": "icons/icon-16.png",
     "48": "icons/icon-48.png",
@@ -22,7 +22,7 @@
     "service_worker": "background.js",
     "type": "module"
   },
-  "permissions": ["storage"],
+  "permissions": ["storage", "downloads"],
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://*.chatgpt.com/*",

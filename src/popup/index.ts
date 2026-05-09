@@ -3,19 +3,20 @@
 // Vanilla DOM, no framework — keeps the extension lean and
 // review-friendly.
 //
-// The extension delivers markdown to the local Miyo desktop app over
-// loopback HTTP. The popup's job is to (a) tell the user whether
-// Miyo is running, (b) show per-site sign-in status, and (c) trigger
-// sync runs that the background service worker executes.
+// The popup's job is to (a) tell the user where files will go (Miyo
+// library if Miyo is running, ~/Downloads/Miyo otherwise), (b) show
+// per-site sign-in status, and (c) trigger sync runs that the
+// background service worker executes.
 
 import type { PopupSnapshot, SiteId } from '../framework/types.js';
+import type { TransportMode } from '../framework/transports/index.js';
 
 type SyncDone = {
   type: 'done';
   site: SiteId;
   result:
-    | { kind: 'completed'; written: number; errors: number }
-    | { kind: 'paused'; written: number; reason: string }
+    | { kind: 'completed'; written: number; errors: number; mode: TransportMode }
+    | { kind: 'paused'; written: number; reason: string; mode: TransportMode }
     | { kind: 'aborted'; reason: string };
 };
 
@@ -23,7 +24,7 @@ interface UIState {
   snapshot: PopupSnapshot | null;
   initializing: boolean;
   syncing: SiteId | null;
-  progress: { completed: number; total: number | null } | null;
+  progress: { completed: number; total: number | null; mode: TransportMode } | null;
   banner: { kind: 'info' | 'error'; text: string } | null;
 }
 
@@ -62,32 +63,46 @@ function escape(s: string): string {
   );
 }
 
-function miyoStatusBlock(): string {
+function transportBlock(): string {
   if (!ui.snapshot) return '';
-  const m = ui.snapshot.miyo;
-  if (m.state === 'connected') {
-    const v = m.version ? ` v${escape(m.version)}` : '';
-    return `<div class="banner ok"><span class="muted">Connected to Miyo${v}</span></div>`;
+  const t = ui.snapshot.transports;
+  if (t.active === 'miyo') {
+    const label = t.miyo.label ?? 'Miyo';
+    return `
+      <div class="banner ok">
+        <div class="row">
+          <span class="muted">Saving to ${escape(label)} · indexed for search</span>
+        </div>
+      </div>`;
+  }
+  if (t.active === 'downloads') {
+    return `
+      <div class="banner">
+        <div class="row">
+          <span class="muted">Saving to <code>~/Downloads/Miyo</code></span>
+          <a href="https://github.com/Brevilabs/miyo" target="_blank" rel="noopener">Get Miyo</a>
+        </div>
+        <div class="row sub">
+          <span class="muted">Install Miyo to choose your folder and get indexed search.</span>
+        </div>
+      </div>`;
   }
   return `
     <div class="banner">
-      <div class="row">
-        <span class="error">Miyo desktop app is not running.</span>
-        <button data-action="refresh">Retry</button>
-      </div>
+      <span class="error">No delivery transport available. Reload the extension and try again.</span>
     </div>`;
 }
 
 function renderSites(): string {
   if (!ui.snapshot) return '';
-  const miyoOk = ui.snapshot.miyo.state === 'connected';
+  const transportOk = ui.snapshot.transports.active !== null;
   const anySyncing = ui.syncing !== null;
 
   return ui.snapshot.sites
     .map((s) => {
       const signedIn = !!s.session?.signedIn;
       const isCurrent = ui.syncing === s.id;
-      const disabled = !miyoOk || !signedIn || (anySyncing && !isCurrent);
+      const disabled = !transportOk || !signedIn || (anySyncing && !isCurrent);
 
       const meta: string[] = [];
       if (signedIn) {
@@ -136,7 +151,7 @@ function render(): void {
         ? `<div class="banner"><span class="${ui.banner.kind === 'error' ? 'error' : 'muted'}">${escape(ui.banner.text)}</span></div>`
         : ''
     }
-    ${miyoStatusBlock()}
+    ${transportBlock()}
     <h2>Sites</h2>
     ${renderSites()}
     <footer>
@@ -155,33 +170,34 @@ function render(): void {
 
 async function onSync(site: SiteId): Promise<void> {
   ui.banner = null;
-  if (!ui.snapshot || ui.snapshot.miyo.state !== 'connected') {
-    ui.banner = { kind: 'error', text: 'Miyo desktop app is not running.' };
+  if (!ui.snapshot || ui.snapshot.transports.active === null) {
+    ui.banner = { kind: 'error', text: 'No delivery transport available.' };
     render();
     return;
   }
 
   ui.syncing = site;
-  ui.progress = { completed: 0, total: null };
+  ui.progress = { completed: 0, total: null, mode: ui.snapshot.transports.active };
   render();
 
   const port = chrome.runtime.connect({ name: 'sync' });
   port.postMessage({ type: 'start', site });
   port.onMessage.addListener((msg) => {
     if (msg?.type === 'progress' && msg.site === site) {
-      ui.progress = { completed: msg.completed, total: msg.total };
+      ui.progress = { completed: msg.completed, total: msg.total, mode: msg.mode };
       render();
     } else if (msg?.type === 'done') {
       const done = msg as SyncDone;
       ui.syncing = null;
       ui.progress = null;
       if (done.result.kind === 'completed') {
+        const dest = done.result.mode === 'miyo' ? 'Miyo' : '~/Downloads/Miyo';
         ui.banner = {
           kind: 'info',
           text:
             done.result.errors > 0
-              ? `Synced ${done.result.written} (${done.result.errors} failed).`
-              : `Synced ${done.result.written} conversations.`,
+              ? `Synced ${done.result.written} to ${dest} (${done.result.errors} failed).`
+              : `Synced ${done.result.written} conversations to ${dest}.`,
         };
       } else if (done.result.kind === 'paused') {
         ui.banner = {
@@ -191,7 +207,12 @@ async function onSync(site: SiteId): Promise<void> {
       } else if (done.result.reason === 'miyo_unreachable') {
         ui.banner = {
           kind: 'error',
-          text: 'Miyo desktop app went away mid-sync. Restart it and click Sync to resume.',
+          text: 'Miyo went away mid-sync. Restart it and click Sync to resume.',
+        };
+      } else if (done.result.reason === 'no_transport') {
+        ui.banner = {
+          kind: 'error',
+          text: 'No delivery transport available. Reload the extension and try again.',
         };
       } else {
         ui.banner = { kind: 'error', text: `Sync stopped: ${done.result.reason}` };

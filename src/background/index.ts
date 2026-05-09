@@ -1,9 +1,8 @@
 // Service worker entry.
 //
 // Responsibilities:
-//   1. Snapshot building for the popup (Miyo connection + per-site
-//      session/sync state, all read from chrome.storage.local plus a
-//      fresh health check).
+//   1. Snapshot building for the popup (transport availability +
+//      per-site session/sync state).
 //   2. Session probing — runs each adapter's probeSession on
 //      startup, install, and on popup-driven refresh.
 //   3. The sync orchestrator's host. The popup opens a port named
@@ -17,16 +16,11 @@
 import { ADAPTERS, getAdapter } from '../adapters/index.js';
 import { runSync } from '../framework/sync.js';
 import { getSiteState, patchSiteState } from '../framework/state.js';
-import { health } from '../framework/transport.js';
-import type { MiyoConnection, PopupSnapshot } from '../framework/types.js';
-
-async function describeMiyo(): Promise<MiyoConnection> {
-  const h = await health();
-  return h.running ? { state: 'connected', version: h.version } : { state: 'unreachable' };
-}
+import { snapshotTransports } from '../framework/transports/index.js';
+import type { PopupSnapshot } from '../framework/types.js';
 
 async function buildSnapshot(): Promise<PopupSnapshot> {
-  const miyo = await describeMiyo();
+  const transports = await snapshotTransports();
   const sites = await Promise.all(
     ADAPTERS.map(async (a) => {
       const s = await getSiteState(a.id);
@@ -39,7 +33,7 @@ async function buildSnapshot(): Promise<PopupSnapshot> {
       };
     })
   );
-  return { miyo, sites, active_sync: null };
+  return { transports, sites, active_sync: null };
 }
 
 async function probeAll(): Promise<void> {
@@ -96,13 +90,17 @@ chrome.runtime.onConnect.addListener((port) => {
     if (msg?.type !== 'start' || typeof msg.site !== 'string') return;
     const adapter = getAdapter(msg.site);
     if (!adapter) {
-      safePost({ type: 'done', site: msg.site, result: { kind: 'aborted', reason: 'unknown_site' } });
+      safePost({
+        type: 'done',
+        site: msg.site,
+        result: { kind: 'aborted', reason: 'unknown_site' },
+      });
       return;
     }
     void (async () => {
       const result = await runSync(adapter, {
-        onProgress: ({ completed, total }) => {
-          safePost({ type: 'progress', site: adapter.id, completed, total });
+        onProgress: ({ completed, total, mode }) => {
+          safePost({ type: 'progress', site: adapter.id, completed, total, mode });
         },
       });
       safePost({ type: 'done', site: adapter.id, result });
