@@ -15,8 +15,11 @@
 //     between syncs the new file lands beside the old one. The
 //     sampler mode tolerates this; Miyo mode handles renames
 //     properly via the receiver's stable_id dedupe.
-//   - sync_start / sync_finish are no-ops here; there is no Miyo to
-//     inform.
+//   - sync_finish is a no-op here. sync_start regenerates a folder
+//     README that documents how to use the synced files (with local
+//     agents today; with Miyo for cross-AI MCP exposure). The README
+//     is the contextual surface that points users at Miyo when they
+//     are about to consume the synced files.
 
 import type { ItemPayload, SyncFinishPayload, SyncStartPayload, Transport } from './types.js';
 
@@ -27,7 +30,7 @@ export class DownloadsUnavailableError extends Error {
   }
 }
 
-function buildDataUrl(body: string): string {
+function buildDataUrl(body: string, mediaType = 'text/markdown'): string {
   // chrome.downloads.download cannot consume blob: URLs created in
   // the service worker context (URL.createObjectURL is unavailable
   // there). A data: URL works in every MV3 environment we target.
@@ -36,7 +39,46 @@ function buildDataUrl(body: string): string {
   const utf8 = new TextEncoder().encode(body);
   let binary = '';
   for (const byte of utf8) binary += String.fromCharCode(byte);
-  return `data:text/markdown;base64,${btoa(binary)}`;
+  return `data:${mediaType};base64,${btoa(binary)}`;
+}
+
+function buildReadme(payload: SyncStartPayload, sourceId: string): string {
+  const { label, home_url, signed_in_email } = payload;
+  const account = signed_in_email ? ` (signed in as ${signed_in_email})` : '';
+  return `# Your ${label} conversations
+
+Synced by [Miyo Capture](https://miyo.md) from ${home_url}${account}.
+One markdown file per conversation. Yours, on your machine.
+
+This folder is regenerated on every sync. Edits to this README will
+be overwritten — work with the conversation files directly.
+
+## Use with Claude Code, Cursor, or any local agent
+
+Open a terminal here:
+
+\`\`\`
+cd ~/Downloads/Miyo/${sourceId}
+\`\`\`
+
+Then prompt your agent. For example:
+
+> Read the markdown files in this folder. They are my past
+> ${label} conversations. Help me find the discussion about
+> <topic>, and summarize the main decisions.
+
+Local agents can read this folder directly — no extra setup.
+
+## Use with ChatGPT, Claude.ai, or any cloud AI
+
+Cloud AI apps cannot reach files on your machine on their own.
+[Install Miyo](https://miyo.md) to expose this folder to any AI via
+MCP — ask Claude.ai about your ChatGPT history, ask ChatGPT about
+your Claude history, query both from one search.
+
+Miyo is local-first. Miyo doesn't see your context; Miyo helps your
+AI see it.
+`;
 }
 
 export const downloadsTransport: Transport = {
@@ -49,8 +91,23 @@ export const downloadsTransport: Transport = {
     return { available: true, label: '~/Downloads/Miyo' };
   },
 
-  async postSyncStart(_sourceId: string, _payload: SyncStartPayload): Promise<void> {
-    // No-op: nothing to inform.
+  async postSyncStart(sourceId: string, payload: SyncStartPayload): Promise<void> {
+    // Refresh the folder README. This is a contextual marketing
+    // surface: the user (and their local AI agent) encounters it
+    // exactly when they're trying to use the synced files. Failures
+    // are non-fatal — sync should proceed even if the README write
+    // hits an unexpected chrome.downloads error.
+    try {
+      const url = buildDataUrl(buildReadme(payload, sourceId));
+      await chrome.downloads.download({
+        url,
+        filename: `Miyo/${sourceId}/README.md`,
+        conflictAction: 'overwrite',
+        saveAs: false,
+      });
+    } catch {
+      // Swallow: the README is best-effort.
+    }
   },
 
   async postItem(sourceId: string, payload: ItemPayload): Promise<void> {

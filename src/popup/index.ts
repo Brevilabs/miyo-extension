@@ -80,7 +80,7 @@ function transportBlock(): string {
       <div class="banner">
         <div class="row">
           <span class="muted">Saving to <code>~/Downloads/Miyo</code></span>
-          <a href="https://github.com/Brevilabs/miyo" target="_blank" rel="noopener">Get Miyo</a>
+          <a href="https://miyo.md" target="_blank" rel="noopener">Get Miyo</a>
         </div>
         <div class="row sub">
           <span class="muted">Install Miyo to choose your folder and get indexed search.</span>

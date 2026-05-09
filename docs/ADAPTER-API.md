@@ -34,6 +34,8 @@ export const myAdapter: ChatSiteAdapter = {
   id: 'mysite',
   label: 'MySite',
   subdir: 'mysite',
+  home_url: 'https://mysite.example',
+  brand_color: '#3366ff', // optional
   kind: 'chat',
 
   async probeSession() {
@@ -78,6 +80,7 @@ export const bookmarksAdapter: CustomSiteAdapter = {
   id: 'bookmarks',
   label: 'Bookmarks',
   subdir: 'bookmarks',
+  home_url: 'https://bookmarks.example',
   kind: 'custom',
 
   async probeSession() { /* … */ },
@@ -117,6 +120,24 @@ export const ADAPTERS: SiteAdapter[] = [chatgptAdapter, claudeAdapter, myAdapter
 
 And add the host(s) to `public/manifest.json` under
 `host_permissions`.
+
+## Display metadata (for the Miyo desktop)
+
+The fields `home_url`, `brand_color`, and `icon_data_url` are
+forwarded to the Miyo desktop on every `sync/start`. Desktop caches
+the latest values per `source_id` and uses them to render the source
+in the Synced apps view — **no desktop release is needed for a new
+adapter to appear in the UI**.
+
+- **`home_url`** (required). The site's home page. Used as the
+  link target in the desktop's per-source row and in the standalone
+  folder README.
+- **`brand_color`** (optional). Hex color (e.g. `'#10a37f'`). Used
+  for the chip/glyph background. Pick the site's primary brand
+  color or omit and let the desktop use a neutral default.
+- **`icon_data_url`** (optional). An inline SVG as a `data:` URL,
+  if the site has a recognizable mark. Omit and the desktop falls
+  back to a generic glyph + the source label.
 
 ## Framework helpers (for custom adapters)
 

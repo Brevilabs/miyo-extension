@@ -49,6 +49,16 @@ interface BaseSiteAdapter {
   // Miyo's per-source destination convention. Conventionally `<id>/`.
   subdir: string;
 
+  // The site's home page; used for "open ChatGPT" / "open Claude"
+  // affordances and as the public link in the folder README.
+  home_url: string;
+
+  // Optional display metadata forwarded to the Miyo desktop on
+  // sync/start so desktop can render any source_id without a
+  // release. Keep these stable per source.
+  brand_color?: string; // hex, e.g. "#10a37f"
+  icon_data_url?: string; // inline SVG as a data: URL
+
   // Returns user identity if signed in. Never throws on a logged-out
   // browser — return { signedIn: false } instead.
   probeSession(): Promise<SiteSession>;

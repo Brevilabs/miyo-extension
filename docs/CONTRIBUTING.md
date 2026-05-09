@@ -35,8 +35,10 @@ gotchas. The short version:
 - Don't introduce dependencies if you can avoid them. The whole
   extension currently has zero runtime dependencies.
 - Don't add automatic sync, polling, or alarms. The user-initiated
-  posture is load-bearing for the project — see the strategy doc in
-  the main Miyo repo if you want the why.
+  posture is load-bearing for the project — every fetch must be a
+  direct consequence of the user clicking Sync now. This is what
+  keeps the extension framed as the user porting their own data
+  rather than an automated bot.
 
 ## Bug reports
 

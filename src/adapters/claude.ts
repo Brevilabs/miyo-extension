@@ -101,6 +101,8 @@ export const claudeAdapter: ChatSiteAdapter = {
   id: 'claude',
   label: 'Claude',
   subdir: 'claude',
+  home_url: 'https://claude.ai',
+  brand_color: '#c66439',
   kind: 'chat',
 
   async probeSession(): Promise<SiteSession> {

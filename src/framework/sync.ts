@@ -114,10 +114,15 @@ export async function runSync(
   let highestSeen: string | null = cursorAt;
 
   // Tell the transport we are starting (Miyo surfaces "syncing" in
-  // the Synced apps UI; Downloads ignores).
+  // the Synced apps UI and caches display metadata; Downloads writes
+  // a folder README on first run / refreshes it after).
   try {
     await transport.postSyncStart(adapter.id, {
       signed_in_email: state.last_session?.email ?? null,
+      label: adapter.label,
+      home_url: adapter.home_url,
+      brand_color: adapter.brand_color,
+      icon_data_url: adapter.icon_data_url,
     });
   } catch (err) {
     if (err instanceof MiyoUnreachableError) {

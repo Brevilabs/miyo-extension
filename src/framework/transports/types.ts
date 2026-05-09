@@ -13,6 +13,14 @@ export interface TransportHealth {
 
 export interface SyncStartPayload {
   signed_in_email: string | null;
+  // Source display metadata. Carried on every sync/start so the Miyo
+  // desktop can render any new source_id without a release —
+  // adding a source is a pure extension change. Desktop caches the
+  // latest metadata per source_id.
+  label: string;
+  home_url: string;
+  brand_color?: string;
+  icon_data_url?: string;
 }
 
 export interface ItemPayload {
