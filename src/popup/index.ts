@@ -1,18 +1,13 @@
 // Popup UI.
 //
-// Vanilla DOM, no framework — keeps the extension lean and review-friendly.
+// Vanilla DOM, no framework — keeps the extension lean and
+// review-friendly.
 //
-// Two responsibilities the background can't do because they need a
-// user gesture: pick the library directory, and request permission on
-// the stored handle. Everything else is delegated to the background
-// via runtime messages and a long-lived 'sync' port for progress.
+// The extension delivers markdown to the local Miyo desktop app over
+// loopback HTTP. The popup's job is to (a) tell the user whether
+// Miyo is running, (b) show per-site sign-in status, and (c) trigger
+// sync runs that the background service worker executes.
 
-import {
-  getStoredLibraryHandle,
-  pickLibraryDirectory,
-  queryLibraryPermission,
-  requestLibraryPermission,
-} from '../framework/storage.js';
 import type { PopupSnapshot, SiteId } from '../framework/types.js';
 
 type SyncDone = {
@@ -67,41 +62,32 @@ function escape(s: string): string {
   );
 }
 
-function libraryBanner(): string {
+function miyoStatusBlock(): string {
   if (!ui.snapshot) return '';
-  const lib = ui.snapshot.library;
-  if (lib.state === 'granted') return '';
-  if (lib.state === 'unset') {
-    return `
-      <div class="banner">
-        <div class="row">
-          <span class="muted">Choose where Miyo saves your conversations.</span>
-          <button class="primary" data-action="pick">Choose folder</button>
-        </div>
-      </div>`;
+  const m = ui.snapshot.miyo;
+  if (m.state === 'connected') {
+    const v = m.version ? ` v${escape(m.version)}` : '';
+    return `<div class="banner ok"><span class="muted">Connected to Miyo${v}</span></div>`;
   }
-  if (lib.state === 'permission_required') {
-    return `
-      <div class="banner">
-        <div class="row">
-          <span class="muted">Miyo needs permission to write to your library folder.</span>
-          <button class="primary" data-action="regrant">Re-grant access</button>
-        </div>
-      </div>`;
-  }
-  return `<div class="banner"><span class="error">Folder unavailable: ${escape(lib.reason)}</span></div>`;
+  return `
+    <div class="banner">
+      <div class="row">
+        <span class="error">Miyo desktop app is not running.</span>
+        <button data-action="refresh">Retry</button>
+      </div>
+    </div>`;
 }
 
 function renderSites(): string {
   if (!ui.snapshot) return '';
-  const libGranted = ui.snapshot.library.state === 'granted';
+  const miyoOk = ui.snapshot.miyo.state === 'connected';
   const anySyncing = ui.syncing !== null;
 
   return ui.snapshot.sites
     .map((s) => {
       const signedIn = !!s.session?.signedIn;
       const isCurrent = ui.syncing === s.id;
-      const disabled = !libGranted || !signedIn || (anySyncing && !isCurrent);
+      const disabled = !miyoOk || !signedIn || (anySyncing && !isCurrent);
 
       const meta: string[] = [];
       if (signedIn) {
@@ -145,10 +131,12 @@ function render(): void {
   }
   root.innerHTML = `
     <h1>Miyo</h1>
-    ${ui.banner ? `<div class="banner ${ui.banner.kind === 'error' ? '' : ''}">
-      <span class="${ui.banner.kind === 'error' ? 'error' : 'muted'}">${escape(ui.banner.text)}</span>
-    </div>` : ''}
-    ${libraryBanner()}
+    ${
+      ui.banner
+        ? `<div class="banner"><span class="${ui.banner.kind === 'error' ? 'error' : 'muted'}">${escape(ui.banner.text)}</span></div>`
+        : ''
+    }
+    ${miyoStatusBlock()}
     <h2>Sites</h2>
     ${renderSites()}
     <footer>
@@ -159,63 +147,17 @@ function render(): void {
   root.querySelectorAll<HTMLButtonElement>('button[data-action]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const action = btn.dataset.action;
-      if (action === 'pick') void onPickFolder();
-      else if (action === 'regrant') void onRegrantPermission();
-      else if (action === 'sync') void onSync(btn.dataset.site as SiteId);
+      if (action === 'sync') void onSync(btn.dataset.site as SiteId);
       else if (action === 'refresh') void onRefresh();
     });
   });
 }
 
-async function onPickFolder(): Promise<void> {
-  ui.banner = null;
-  try {
-    const handle = await pickLibraryDirectory();
-    const perm = await requestLibraryPermission(handle);
-    if (perm !== 'granted') {
-      ui.banner = { kind: 'error', text: 'Permission was not granted.' };
-    }
-  } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      // User cancelled the picker — silent.
-    } else {
-      ui.banner = { kind: 'error', text: err instanceof Error ? err.message : String(err) };
-    }
-  }
-  await onRefresh();
-}
-
-async function onRegrantPermission(): Promise<void> {
-  ui.banner = null;
-  try {
-    const handle = await getStoredLibraryHandle();
-    if (!handle) {
-      await onPickFolder();
-      return;
-    }
-    const perm = await requestLibraryPermission(handle);
-    if (perm !== 'granted') {
-      ui.banner = { kind: 'error', text: 'Permission was not granted.' };
-    }
-  } catch (err) {
-    ui.banner = { kind: 'error', text: err instanceof Error ? err.message : String(err) };
-  }
-  await onRefresh();
-}
-
 async function onSync(site: SiteId): Promise<void> {
   ui.banner = null;
-  // User-gesture context active here — handle pick / permission can fire.
-  const handle = await getStoredLibraryHandle();
-  if (!handle) {
-    await onPickFolder();
-    return;
-  }
-  const perm = await queryLibraryPermission(handle);
-  if (perm !== 'granted') {
-    await onRegrantPermission();
-    // Don't auto-trigger sync after re-grant — let the user click again
-    // so the action remains intentional.
+  if (!ui.snapshot || ui.snapshot.miyo.state !== 'connected') {
+    ui.banner = { kind: 'error', text: 'Miyo desktop app is not running.' };
+    render();
     return;
   }
 
@@ -245,6 +187,11 @@ async function onSync(site: SiteId): Promise<void> {
         ui.banner = {
           kind: 'info',
           text: `Paused at ${done.result.written}. Click Sync again to continue.`,
+        };
+      } else if (done.result.reason === 'miyo_unreachable') {
+        ui.banner = {
+          kind: 'error',
+          text: 'Miyo desktop app went away mid-sync. Restart it and click Sync to resume.',
         };
       } else {
         ui.banner = { kind: 'error', text: `Sync stopped: ${done.result.reason}` };

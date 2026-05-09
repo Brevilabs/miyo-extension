@@ -1,8 +1,9 @@
 // Service worker entry.
 //
 // Responsibilities:
-//   1. Snapshot building for the popup (library state + per-site
-//      session/sync state, all read from chrome.storage.local).
+//   1. Snapshot building for the popup (Miyo connection + per-site
+//      session/sync state, all read from chrome.storage.local plus a
+//      fresh health check).
 //   2. Session probing — runs each adapter's probeSession on
 //      startup, install, and on popup-driven refresh.
 //   3. The sync orchestrator's host. The popup opens a port named
@@ -16,25 +17,16 @@
 import { ADAPTERS, getAdapter } from '../adapters/index.js';
 import { runSync } from '../framework/sync.js';
 import { getSiteState, patchSiteState } from '../framework/state.js';
-import {
-  getStoredLibraryHandle,
-  queryLibraryPermission,
-} from '../framework/storage.js';
-import type { PopupSnapshot } from '../framework/types.js';
+import { health } from '../framework/transport.js';
+import type { MiyoConnection, PopupSnapshot } from '../framework/types.js';
 
-async function describeLibrary(): Promise<PopupSnapshot['library']> {
-  const handle = await getStoredLibraryHandle();
-  if (!handle) return { state: 'unset' };
-  try {
-    const perm = await queryLibraryPermission(handle);
-    return perm === 'granted' ? { state: 'granted' } : { state: 'permission_required' };
-  } catch (err) {
-    return { state: 'unavailable', reason: err instanceof Error ? err.message : String(err) };
-  }
+async function describeMiyo(): Promise<MiyoConnection> {
+  const h = await health();
+  return h.running ? { state: 'connected', version: h.version } : { state: 'unreachable' };
 }
 
 async function buildSnapshot(): Promise<PopupSnapshot> {
-  const library = await describeLibrary();
+  const miyo = await describeMiyo();
   const sites = await Promise.all(
     ADAPTERS.map(async (a) => {
       const s = await getSiteState(a.id);
@@ -47,7 +39,7 @@ async function buildSnapshot(): Promise<PopupSnapshot> {
       };
     })
   );
-  return { library, sites, active_sync: null };
+  return { miyo, sites, active_sync: null };
 }
 
 async function probeAll(): Promise<void> {

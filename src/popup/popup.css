@@ -102,8 +102,12 @@ button.primary {
   background: var(--row-bg);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 10px 12px;
+  padding: 8px 12px;
   margin-bottom: 8px;
+  font-size: 12px;
+}
+.banner.ok {
+  padding: 6px 12px;
 }
 .banner .row {
   display: flex;

@@ -1,15 +1,16 @@
 // The single sync loop.
 //
 // Driven by the background service worker after the popup hands off a
-// "sync this site now" message. The popup handles all user-gesture
-// concerns (folder picker, permission grant); by the time we get here
-// the library handle exists and we have readwrite permission.
+// "sync this site now" message. The popup ensures Miyo is reachable
+// before triggering; by the time we get here both the source's
+// sign-in status and the local Miyo receiver are healthy enough to
+// start.
 //
 // The framework is content-agnostic: it asks the adapter for a list
-// of item refs, asks the adapter to render each item to a filename +
-// body, and writes the body to disk. It does not know whether the
-// items are chat conversations, documents, bookmarks, or anything
-// else.
+// of item refs, asks the adapter to render each item (chat-rendered
+// by the framework, or custom-rendered by the adapter), and POSTs
+// the rendered markdown to the local Miyo desktop app, which writes
+// it to disk and indexes it.
 //
 // Correctness invariants:
 //
@@ -17,31 +18,29 @@
 //      advances at the end of a fully-completed run. A partial run
 //      that gets interrupted leaves the cursor unchanged, and the
 //      next click resumes via `SyncProgress.pending_ids` — we do not
-//      re-fetch items we already wrote.
+//      re-deliver items we already POSTed.
 //
-//   2. SyncProgress is persisted after every individual write. A
-//      service-worker kill at any point loses at most one in-flight
-//      fetch; everything written to disk is reflected in
-//      chrome.storage.local before the next item starts.
+//   2. SyncProgress is persisted after every individual successful
+//      POST. A service-worker kill at any point loses at most one
+//      in-flight delivery; everything Miyo has already written is
+//      reflected in chrome.storage.local before the next item starts.
 //
-//   3. File writes are idempotent. Adapter contract guarantees the
-//      same item id produces a deterministic filename. Re-fetches
-//      overwrite the existing file. Filename changes (title rename,
-//      etc.) trigger a write-then-delete rename so a crash between
-//      the two leaves a harmless duplicate, never a missing file.
+//   3. Deliveries are idempotent. Adapter contract guarantees the
+//      same item id produces a deterministic filename. Re-deliveries
+//      overwrite the existing file on Miyo's side. Filename changes
+//      (title rename, etc.) — the orchestrator records the new
+//      filename and Miyo handles the rename based on `stable_id`.
 //
 //   4. Listing is newest-first; the first item with
-//      `updated_at <= cursor` lets us terminate paging early. Without
-//      this the first sync after a long quiet period is still bounded
-//      by `MAX_PER_RUN` instead of the user's full history.
+//      `updated_at <= cursor` lets us terminate paging early.
 //
-//   5. 401/403 from any call stops the run and marks the site as
-//      signed-out. Subsequent calls would all fail the same way and
-//      the user must re-sign-in in their browser tab.
+//   5. 401/403 from any site call stops the run and marks the source
+//      as signed-out. Subsequent calls would all fail the same way.
 //
-// The orchestrator collects per-item errors but never aborts the run
-// on them. A 429 from a single fetch surfaces as one "1 item failed"
-// line; the rest of the run completes.
+//   6. MiyoUnreachableError from any transport call stops the run
+//      cleanly. The sync state is preserved (cursor unchanged,
+//      pending_ids intact); the next click after Miyo is back picks
+//      up where we left off.
 
 import { FatalError, paced } from './rate-limit.js';
 import {
@@ -51,36 +50,15 @@ import {
   setSyncProgress,
 } from './state.js';
 import {
-  getStoredLibraryHandle,
-  queryLibraryPermission,
-  writeMarkdown,
-} from './storage.js';
+  health,
+  MiyoUnreachableError,
+  postItem,
+  postSyncFinish,
+  postSyncStart,
+} from './transport.js';
 import { renderChatConversationMarkdown } from './chat.js';
 import { makeDatePrefixedFilename } from './filename.js';
 import type { RenderedItem, SiteAdapter, SyncProgress } from './types.js';
-
-// Resolves an adapter's per-item render output. For chat adapters the
-// framework owns both filename and body — that's the whole point of
-// the discriminated union; we want every chat provider to produce the
-// same markdown layout so a user's library is uniform across vendors.
-// Custom adapters bring their own.
-async function renderForAdapter(
-  adapter: SiteAdapter,
-  id: string
-): Promise<RenderedItem> {
-  if (adapter.kind === 'chat') {
-    const conv = await adapter.fetchConversation(id);
-    return {
-      filename: makeDatePrefixedFilename({
-        id: conv.conversation_id,
-        title: conv.title,
-        createdAt: conv.created_at,
-      }),
-      body: renderChatConversationMarkdown(conv),
-    };
-  }
-  return adapter.fetchItem(id);
-}
 
 // Cap a single Sync click. Multi-thousand-item histories see
 // "Continue sync" on the next click rather than chewing the SW for
@@ -108,21 +86,55 @@ function freshProgress(): SyncProgress {
   };
 }
 
+// Resolves an adapter's per-item render output. For chat adapters the
+// framework owns both filename and body; custom adapters bring their
+// own.
+async function renderForAdapter(
+  adapter: SiteAdapter,
+  id: string
+): Promise<RenderedItem> {
+  if (adapter.kind === 'chat') {
+    const conv = await adapter.fetchConversation(id);
+    return {
+      filename: makeDatePrefixedFilename({
+        id: conv.conversation_id,
+        title: conv.title,
+        createdAt: conv.created_at,
+      }),
+      body: renderChatConversationMarkdown(conv),
+    };
+  }
+  return adapter.fetchItem(id);
+}
+
 export async function runSync(
   adapter: SiteAdapter,
   callbacks: SyncCallbacks
 ): Promise<SyncResult> {
-  const root = await getStoredLibraryHandle();
-  if (!root) return { kind: 'aborted', reason: 'no_library' };
-
-  const perm = await queryLibraryPermission(root);
-  if (perm !== 'granted') return { kind: 'aborted', reason: 'permission_required' };
+  const miyo = await health();
+  if (!miyo.running) {
+    return { kind: 'aborted', reason: 'miyo_unreachable' };
+  }
 
   const state = await getSiteState(adapter.id);
   const progress = (await getSyncProgress(adapter.id)) ?? freshProgress();
   const filenames = { ...state.filenames };
   const cursorAt = state.cursor_updated_at;
   let highestSeen: string | null = cursorAt;
+
+  // Tell Miyo we are starting; it will surface "syncing" state in the
+  // Synced apps UI. If this fails we have not done any work, so
+  // aborting is clean.
+  try {
+    await postSyncStart(adapter.id, {
+      signed_in_email: state.last_session?.email ?? null,
+    });
+  } catch (err) {
+    if (err instanceof MiyoUnreachableError) {
+      return { kind: 'aborted', reason: 'miyo_unreachable' };
+    }
+    throw err;
+  }
 
   const finalizeAsSignedOut = async (): Promise<SyncResult> => {
     await patchSiteState(adapter.id, {
@@ -131,6 +143,13 @@ export async function runSync(
       last_probe_at: Date.now(),
     });
     await setSyncProgress(adapter.id, null);
+    // Best-effort sync_finish so Miyo's UI exits the syncing state.
+    await postSyncFinish(adapter.id, {
+      written: progress.completed,
+      errors: progress.errors.length,
+      cursor_updated_at: cursorAt,
+      error_summary: 'signed_out',
+    }).catch(() => {});
     return { kind: 'aborted', reason: 'signed_out' };
   };
 
@@ -166,23 +185,30 @@ export async function runSync(
       const id = progress.pending_ids.shift()!;
       try {
         const rendered = await paced(adapter.id, () => renderForAdapter(adapter, id));
-        await writeMarkdown({
-          root,
-          subdir: adapter.subdir,
+        await postItem(adapter.id, {
           filename: rendered.filename,
-          oldFilename: filenames[id] ?? null,
           body: rendered.body,
+          stable_id: id,
+          updated_at: highestSeen,
         });
 
         filenames[id] = rendered.filename;
         progress.completed += 1;
 
-        // Persist after every write so a SW restart loses at most the
-        // in-flight fetch, never bookkeeping for files already on disk.
+        // Persist after every successful POST so a SW restart loses
+        // at most the in-flight delivery, never bookkeeping for items
+        // Miyo has already written.
         await patchSiteState(adapter.id, { filenames });
         await setSyncProgress(adapter.id, progress);
         callbacks.onProgress({ completed: progress.completed, total: progress.total });
       } catch (err) {
+        if (err instanceof MiyoUnreachableError) {
+          // Hard abort. State is preserved (cursor unchanged,
+          // pending_ids intact). The next click after Miyo is back
+          // resumes from here.
+          await patchSiteState(adapter.id, { last_sync_error: 'miyo_unreachable' });
+          return { kind: 'aborted', reason: 'miyo_unreachable' };
+        }
         if (err instanceof FatalError && (err.status === 401 || err.status === 403)) {
           return finalizeAsSignedOut();
         }
@@ -195,7 +221,16 @@ export async function runSync(
     const reachedCap = progress.completed >= MAX_PER_RUN && !progress.list_exhausted;
     if (reachedCap) {
       // Cursor stays where it was; pending_ids and list_cursor remain
-      // in chrome.storage so the next click resumes mid-run.
+      // in chrome.storage so the next click resumes mid-run. We tell
+      // Miyo the run is paused so the UI stops showing "syncing".
+      await postSyncFinish(adapter.id, {
+        written: progress.completed,
+        errors: progress.errors.length,
+        cursor_updated_at: cursorAt,
+        error_summary: progress.errors.length > 0
+          ? `${progress.errors.length} item(s) failed; paused at cap`
+          : 'paused at cap',
+      }).catch(() => {});
       return { kind: 'paused', written: progress.completed, reason: 'cap_reached' };
     }
 
@@ -208,13 +243,31 @@ export async function runSync(
           : null,
     });
     await setSyncProgress(adapter.id, null);
+    await postSyncFinish(adapter.id, {
+      written: progress.completed,
+      errors: progress.errors.length,
+      cursor_updated_at: highestSeen,
+      error_summary: progress.errors.length > 0
+        ? `${progress.errors.length} item(s) failed`
+        : null,
+    }).catch(() => {});
     return { kind: 'completed', written: progress.completed, errors: progress.errors.length };
   } catch (err) {
+    if (err instanceof MiyoUnreachableError) {
+      await patchSiteState(adapter.id, { last_sync_error: 'miyo_unreachable' });
+      return { kind: 'aborted', reason: 'miyo_unreachable' };
+    }
     if (err instanceof FatalError && (err.status === 401 || err.status === 403)) {
       return finalizeAsSignedOut();
     }
     const message = err instanceof Error ? err.message : String(err);
     await patchSiteState(adapter.id, { last_sync_error: message });
+    await postSyncFinish(adapter.id, {
+      written: progress.completed,
+      errors: progress.errors.length,
+      cursor_updated_at: cursorAt,
+      error_summary: message,
+    }).catch(() => {});
     return { kind: 'aborted', reason: message };
   }
 }

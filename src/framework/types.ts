@@ -27,13 +27,14 @@ export interface ItemListPage {
   total: number | null;
 }
 
-// What a custom adapter returns from fetchItem. Written directly to
-// `<library>/<adapter.subdir>/<filename>`.
+// What a custom adapter returns from fetchItem. The framework forwards
+// `body` to Miyo with the given `filename`; Miyo writes it under the
+// connector's destination directory.
 //
 // `filename` MUST be deterministic: the same item id with the same
-// content state must always produce the same filename, so re-fetches
-// overwrite cleanly and the framework can detect filename changes
-// (title rename, etc.) by diffing against the persisted filenames map.
+// content state must always produce the same filename, so re-deliveries
+// overwrite cleanly and Miyo can detect filename changes (title rename,
+// etc.) by diffing against its persisted filenames map.
 export interface RenderedItem {
   filename: string;
   body: string;
@@ -44,8 +45,9 @@ interface BaseSiteAdapter {
   id: SiteId;
   label: string;
 
-  // Subdirectory under the user's library directory where this
-  // adapter writes files. Conventionally `<id>/`.
+  // Subdirectory hint used when documenting where Miyo writes files.
+  // Conventionally `<id>/`. Miyo's connector destination_path takes
+  // precedence at write time.
   subdir: string;
 
   // Returns user identity if signed in. Never throws on a logged-out
@@ -88,9 +90,11 @@ export interface SiteState {
   // Null before the first successful sync.
   cursor_updated_at: string | null;
 
-  // Map from item id → on-disk filename. Lets us rename the file
-  // when the filename derivation changes (typically title rename)
-  // without leaving an orphan under the old name.
+  // Map from item id → last-delivered filename. Lets us tell Miyo
+  // about filename changes (the orchestrator passes the prior
+  // filename in the post payload — though as of v1 Miyo derives
+  // renames from `stable_id` + new filename rather than needing the
+  // prior name explicitly).
   filenames: Record<string, string>;
 
   // Last sign-in probe result, cached for popup display so it doesn't
@@ -117,14 +121,13 @@ export interface SyncProgress {
   list_exhausted: boolean;
 }
 
-export type LibraryAccess =
-  | { state: 'unset' }
-  | { state: 'granted' }
-  | { state: 'permission_required' }
-  | { state: 'unavailable'; reason: string };
+// Connection to the Miyo desktop app's local HTTP receiver.
+export type MiyoConnection =
+  | { state: 'connected'; version: string | null }
+  | { state: 'unreachable' };
 
 export interface PopupSnapshot {
-  library: LibraryAccess;
+  miyo: MiyoConnection;
   sites: Array<{
     id: SiteId;
     label: string;

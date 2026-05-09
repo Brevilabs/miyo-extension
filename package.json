@@ -1,6 +1,6 @@
 {
   "name": "miyo-extension",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Capture your AI chat history (ChatGPT, Claude) into local markdown files for Miyo and any tool that reads markdown.",
   "private": true,
   "license": "MIT",
