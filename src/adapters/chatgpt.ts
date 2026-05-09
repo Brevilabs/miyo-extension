@@ -1,25 +1,16 @@
 // ChatGPT site adapter.
 //
-// The adapter owns its data shape (chat conversations from
-// `/backend-api/conversation/{id}`) and its markdown rendering. It
-// uses framework helpers for the parts that should stay consistent
-// across adapters — filename derivation and chat-style rendering —
-// but it is not required to. Future adapters whose data is not chat
-// can ignore framework/chat.ts and emit any markdown layout they want.
+// Chat-shaped — returns a normalized ChatConversation; the framework
+// derives the filename and renders the markdown so output is uniform
+// with every other chat adapter.
 
 import type {
+  ChatSiteAdapter,
   ItemListPage,
-  RenderedItem,
-  SiteAdapter,
   SiteSession,
 } from '../framework/types.js';
 import { classifyHttp, FatalError } from '../framework/rate-limit.js';
-import {
-  renderChatConversationMarkdown,
-  type ChatConversation,
-  type ChatMessage,
-} from '../framework/chat.js';
-import { makeDatePrefixedFilename } from '../framework/filename.js';
+import type { ChatConversation, ChatMessage } from '../framework/chat.js';
 
 type ChatgptTime = number | string | null | undefined;
 
@@ -185,22 +176,11 @@ function flatten(full: ChatgptFullConversation): ChatMessage[] {
   return out;
 }
 
-function toConversation(full: ChatgptFullConversation): ChatConversation {
-  return {
-    site: 'chatgpt',
-    conversation_id: full.conversation_id,
-    title: full.title,
-    url: `https://chatgpt.com/c/${full.conversation_id}`,
-    created_at: toIsoString(full.create_time),
-    updated_at: toIsoString(full.update_time),
-    messages: flatten(full),
-  };
-}
-
-export const chatgptAdapter: SiteAdapter = {
+export const chatgptAdapter: ChatSiteAdapter = {
   id: 'chatgpt',
   label: 'ChatGPT',
   subdir: 'chatgpt',
+  kind: 'chat',
 
   async probeSession(): Promise<SiteSession> {
     try {
@@ -233,17 +213,17 @@ export const chatgptAdapter: SiteAdapter = {
     return { items, next_cursor, total };
   },
 
-  async fetchItem(id: string): Promise<RenderedItem> {
+  async fetchConversation(id: string): Promise<ChatConversation> {
     const t = await fetchAccessToken();
     const full = await chatgptApi<ChatgptFullConversation>(t.value, `/conversation/${id}`);
-    const conv = toConversation(full);
     return {
-      filename: makeDatePrefixedFilename({
-        id: conv.conversation_id,
-        title: conv.title,
-        createdAt: conv.created_at,
-      }),
-      body: renderChatConversationMarkdown(conv),
+      site: 'chatgpt',
+      conversation_id: full.conversation_id,
+      title: full.title,
+      url: `https://chatgpt.com/c/${full.conversation_id}`,
+      created_at: toIsoString(full.create_time),
+      updated_at: toIsoString(full.update_time),
+      messages: flatten(full),
     };
   },
 };

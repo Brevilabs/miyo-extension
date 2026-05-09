@@ -1,5 +1,7 @@
 // Cross-cutting types shared by the framework, adapters, and UI.
 
+import type { ChatConversation } from './chat.js';
+
 export type SiteId = string;
 
 export interface SiteSession {
@@ -25,17 +27,11 @@ export interface ItemListPage {
   total: number | null;
 }
 
-// What an adapter returns from fetchItem. The framework writes this
-// directly to disk under <library>/<adapter.subdir>/<filename>.
+// What a custom adapter returns from fetchItem. Written directly to
+// `<library>/<adapter.subdir>/<filename>`.
 //
-// The adapter owns both the filename and the body. This is deliberate:
-// different sites express different things (chat conversations,
-// documents, bookmarks, emails, RSS items, …) and a single
-// framework-imposed format would misrepresent some of them. Adapters
-// decide what their data looks like as markdown.
-//
-// `filename` MUST be deterministic: the same item id must always
-// produce the same filename for a given content state, so re-fetches
+// `filename` MUST be deterministic: the same item id with the same
+// content state must always produce the same filename, so re-fetches
 // overwrite cleanly and the framework can detect filename changes
 // (title rename, etc.) by diffing against the persisted filenames map.
 export interface RenderedItem {
@@ -43,11 +39,8 @@ export interface RenderedItem {
   body: string;
 }
 
-// Implemented by `adapters/<site>.ts`. Adapters are pure: they fetch
-// data and render it. They never touch the file system, never decide
-// when to run, and never pace themselves — the framework owns those
-// concerns.
-export interface SiteAdapter {
+// Common adapter surface shared by both kinds.
+interface BaseSiteAdapter {
   id: SiteId;
   label: string;
 
@@ -55,7 +48,7 @@ export interface SiteAdapter {
   // adapter writes files. Conventionally `<id>/`.
   subdir: string;
 
-  // Returns user identity if signed in, never throws on a logged-out
+  // Returns user identity if signed in. Never throws on a logged-out
   // browser — return { signedIn: false } instead.
   probeSession(): Promise<SiteSession>;
 
@@ -63,20 +56,29 @@ export interface SiteAdapter {
   // paging once it sees an updated_at <= the last successful sync's
   // cursor.
   listItems(cursor: string | null): Promise<ItemListPage>;
+}
 
-  // Fetches one item and renders it as markdown. The adapter chooses
-  // both the filename and the body. Throws on hard failure; the
-  // framework classifies (FatalError 401/403 → signed_out; everything
-  // else → per-item error logged, sync continues).
-  //
-  // The framework provides utilities the adapter MAY use:
-  //   - framework/filename.ts (sanitizeTitleForFilename, shortenId,
-  //     makeDatePrefixedFilename)
-  //   - framework/markdown.ts (escapeYaml, formatTimestamp)
-  //   - framework/chat.ts (renderChatConversationMarkdown — for chat
-  //     adapters specifically)
+// Chat-shaped adapter. Submits a normalized ChatConversation; the
+// framework derives the filename and renders the markdown. This keeps
+// chat output uniform across every chat provider (ChatGPT, Claude,
+// future Gemini/Grok/etc.) so a Miyo library reads as one corpus
+// rather than per-vendor formats.
+export interface ChatSiteAdapter extends BaseSiteAdapter {
+  kind: 'chat';
+  fetchConversation(id: string): Promise<ChatConversation>;
+}
+
+// Custom adapter. Owns its own filename and markdown body. Used for
+// sites whose data is not chat-shaped (notes, bookmarks, documents,
+// emails, RSS items). The adapter MAY use the framework helpers in
+// `framework/filename.ts` and `framework/markdown.ts` for consistency,
+// but is not required to.
+export interface CustomSiteAdapter extends BaseSiteAdapter {
+  kind: 'custom';
   fetchItem(id: string): Promise<RenderedItem>;
 }
+
+export type SiteAdapter = ChatSiteAdapter | CustomSiteAdapter;
 
 // Per-site, per-installation persistent state. Survives browser
 // restarts. Stored in chrome.storage.local under `state:<siteId>`.
@@ -86,8 +88,8 @@ export interface SiteState {
   // Null before the first successful sync.
   cursor_updated_at: string | null;
 
-  // Map from item id → on-disk filename. Lets us rename the file when
-  // the adapter's filename derivation changes (e.g. title rename)
+  // Map from item id → on-disk filename. Lets us rename the file
+  // when the filename derivation changes (typically title rename)
   // without leaving an orphan under the old name.
   filenames: Record<string, string>;
 

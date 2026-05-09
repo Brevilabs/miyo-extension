@@ -1,23 +1,15 @@
 // Claude.ai site adapter.
 //
-// Same pattern as chatgpt.ts: the adapter owns its data shape and
-// renders to markdown. It happens to be chat-shaped, so it uses
-// framework/chat.ts; a future Claude-Projects or Claude-Artifacts
-// adapter (or any non-chat site) would render differently.
+// Chat-shaped — returns ChatConversation; framework derives filename
+// and renders markdown.
 
 import type {
+  ChatSiteAdapter,
   ItemListPage,
-  RenderedItem,
-  SiteAdapter,
   SiteSession,
 } from '../framework/types.js';
 import { classifyHttp } from '../framework/rate-limit.js';
-import {
-  renderChatConversationMarkdown,
-  type ChatConversation,
-  type ChatMessage,
-} from '../framework/chat.js';
-import { makeDatePrefixedFilename } from '../framework/filename.js';
+import type { ChatConversation, ChatMessage } from '../framework/chat.js';
 
 interface ClaudeOrgEntry {
   uuid: string;
@@ -105,22 +97,11 @@ function toMessages(full: ClaudeFullConversation): ChatMessage[] {
     .filter((m) => m.text);
 }
 
-function toConversation(full: ClaudeFullConversation): ChatConversation {
-  return {
-    site: 'claude',
-    conversation_id: full.uuid,
-    title: full.name,
-    url: `https://claude.ai/chat/${full.uuid}`,
-    created_at: full.created_at,
-    updated_at: full.updated_at,
-    messages: toMessages(full),
-  };
-}
-
-export const claudeAdapter: SiteAdapter = {
+export const claudeAdapter: ChatSiteAdapter = {
   id: 'claude',
   label: 'Claude',
   subdir: 'claude',
+  kind: 'chat',
 
   async probeSession(): Promise<SiteSession> {
     try {
@@ -157,19 +138,19 @@ export const claudeAdapter: SiteAdapter = {
     return { items, next_cursor, total: sorted.length };
   },
 
-  async fetchItem(id: string): Promise<RenderedItem> {
+  async fetchConversation(id: string): Promise<ChatConversation> {
     const orgId = await discoverOrgId();
     const full = await claudeApi<ClaudeFullConversation>(
       `/api/organizations/${orgId}/chat_conversations/${id}?tree=True&rendering_mode=raw`
     );
-    const conv = toConversation(full);
     return {
-      filename: makeDatePrefixedFilename({
-        id: conv.conversation_id,
-        title: conv.title,
-        createdAt: conv.created_at,
-      }),
-      body: renderChatConversationMarkdown(conv),
+      site: 'claude',
+      conversation_id: full.uuid,
+      title: full.name,
+      url: `https://claude.ai/chat/${full.uuid}`,
+      created_at: full.created_at,
+      updated_at: full.updated_at,
+      messages: toMessages(full),
     };
   },
 };

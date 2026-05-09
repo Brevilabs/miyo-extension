@@ -55,7 +55,32 @@ import {
   queryLibraryPermission,
   writeMarkdown,
 } from './storage.js';
-import type { SiteAdapter, SyncProgress } from './types.js';
+import { renderChatConversationMarkdown } from './chat.js';
+import { makeDatePrefixedFilename } from './filename.js';
+import type { RenderedItem, SiteAdapter, SyncProgress } from './types.js';
+
+// Resolves an adapter's per-item render output. For chat adapters the
+// framework owns both filename and body — that's the whole point of
+// the discriminated union; we want every chat provider to produce the
+// same markdown layout so a user's library is uniform across vendors.
+// Custom adapters bring their own.
+async function renderForAdapter(
+  adapter: SiteAdapter,
+  id: string
+): Promise<RenderedItem> {
+  if (adapter.kind === 'chat') {
+    const conv = await adapter.fetchConversation(id);
+    return {
+      filename: makeDatePrefixedFilename({
+        id: conv.conversation_id,
+        title: conv.title,
+        createdAt: conv.created_at,
+      }),
+      body: renderChatConversationMarkdown(conv),
+    };
+  }
+  return adapter.fetchItem(id);
+}
 
 // Cap a single Sync click. Multi-thousand-item histories see
 // "Continue sync" on the next click rather than chewing the SW for
@@ -140,7 +165,7 @@ export async function runSync(
 
       const id = progress.pending_ids.shift()!;
       try {
-        const rendered = await paced(adapter.id, () => adapter.fetchItem(id));
+        const rendered = await paced(adapter.id, () => renderForAdapter(adapter, id));
         await writeMarkdown({
           root,
           subdir: adapter.subdir,
