@@ -47,7 +47,7 @@ function buildReadme(payload: SyncStartPayload, sourceId: string): string {
   const account = signed_in_email ? ` (signed in as ${signed_in_email})` : '';
   return `# Your ${label} conversations
 
-Synced by [Miyo Capture](https://miyo.md) from ${home_url}${account}.
+Synced by [Miyo Sync](https://miyo.md) from ${home_url}${account}.
 One markdown file per conversation. Yours, on your machine.
 
 This folder is regenerated on every sync. Edits to this README will

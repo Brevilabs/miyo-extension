@@ -1,4 +1,4 @@
-# Miyo Capture
+# Miyo Sync
 
 > Liberate any logged-in data into markdown your AI can use.
 
@@ -11,31 +11,48 @@ This is a **personal data extractor**, not a web clipper. We don't
 optimize for "save this article" — we optimize for "get my ChatGPT
 history out so my own AI tools can use it."
 
-## What it captures today
+## What it syncs today
 
 - **ChatGPT** — full conversation history, including titles and
   timestamps.
 - **Claude (claude.ai)** — full conversation history.
 
-More sources are added one adapter at a time — see
+## What's coming
+
+ChatGPT and Claude are the launch wedge — they're where the most
+locked-in personal context lives today. They're not the destination.
+The product is a **personal data extractor for any walled-garden
+SaaS**, and the source list is meant to grow:
+
+- More AI chat providers (Gemini, Grok, …)
+- Browser bookmarks and reading history
+- Note apps (Notion, …)
+- More SaaS as community contributions land
+
+Adding a source is one ~150-line adapter — see
 [docs/ADAPTER-API.md](docs/ADAPTER-API.md). The framework handles
 rate limiting, pagination, file writes, progress UI, and state
-persistence; an adapter is ~150 lines of API calls and shape
-normalization.
+persistence.
+
+Both ChatGPT and Claude are accessed via unofficial APIs and could
+be revoked at any time. Portfolio breadth is the durability story.
 
 ## How delivery works
 
-The extension picks one of two transports automatically per sync run:
+The extension picks one of two transports automatically per sync run.
+**In both modes, files stay on your machine. Nothing is uploaded.**
 
-- **Standalone** — files land in `~/Downloads/Miyo/<source>/`.
-  Works the moment you install. The sync also writes a README in
-  the folder telling your local AI agent (Claude Code, Cursor,
-  Codex, …) how to use these files.
-- **With [Miyo](https://miyo.md) installed** — files land in your
-  chosen Miyo library folder, get indexed for semantic search, and
-  appear in the Synced apps view in the Miyo desktop app. Plus:
-  your AI history becomes queryable via MCP from inside ChatGPT,
-  Claude.ai, and any agent that speaks MCP.
+- **Standalone** — files land in `~/Downloads/Miyo/<source>/`. Works
+  the moment you install. The sync writes a folder README telling
+  your local AI agent (Claude Code, Cursor, Codex, …) how to use the
+  files.
+- **With [Miyo](https://miyo.md) installed** — files land in a
+  folder *you choose*, on your machine. Miyo indexes them for
+  **semantic search** and serves them over **MCP**, so your favorite
+  AI app — ChatGPT and Claude.ai in the cloud, Claude Code and
+  Cursor locally — can query your full history on demand. Miyo
+  doesn't see the contents; it only opens a local door for the AI to
+  read through.
 
 Install Miyo later and your next sync routes through the richer
 transport automatically. No setting, no toggle.
@@ -44,7 +61,7 @@ transport automatically. No setting, no toggle.
 
 Each conversation lands at
 `<dest>/<source>/<YYYY-MM-DD> <title> (<shortId>).md`, where
-`<dest>` is your Miyo library folder (Miyo mode) or
+`<dest>` is the folder you chose in Miyo (Miyo mode) or
 `~/Downloads/Miyo` (standalone mode). The file contains:
 
 - YAML frontmatter with `platform`, `conversation_id`, `title`,
