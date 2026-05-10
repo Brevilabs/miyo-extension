@@ -1,5 +1,7 @@
-// Zip ./dist into miyo-extension-<version>.zip for Chrome Web Store
-// upload or GitHub release attachment.
+// Zip ./dist into miyo-sync-chrome-<version>.zip for Chrome Web Store
+// upload or GitHub release attachment. The "chrome" postfix exists
+// so Firefox and Safari artifacts can ship beside it later under
+// the same naming scheme (miyo-sync-firefox-..., miyo-sync-safari-...).
 
 import { readFile } from 'fs/promises';
 import { createWriteStream } from 'fs';
@@ -13,7 +15,7 @@ const ROOT = resolve(__dirname, '..');
 const manifest = JSON.parse(
   await readFile(resolve(ROOT, 'dist/manifest.json'), 'utf8')
 );
-const out = resolve(ROOT, `miyo-extension-${manifest.version}.zip`);
+const out = resolve(ROOT, `miyo-sync-chrome-${manifest.version}.zip`);
 
 const child = spawn('zip', ['-r', out, '.'], {
   cwd: resolve(ROOT, 'dist'),
