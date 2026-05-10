@@ -40,29 +40,36 @@ be revoked at any time. Portfolio breadth is the durability story.
 ## How delivery works
 
 The extension picks one of two transports automatically per sync run.
-**In both modes, files stay on your machine. Nothing is uploaded.**
+**In both modes, your data stays on your machine. Nothing is uploaded.**
 
-- **Standalone** — files land in `~/Downloads/Miyo/<source>/`. Works
-  the moment you install. The sync writes a folder README telling
-  your local AI agent (Claude Code, Cursor, Codex, …) how to use the
-  files.
+- **Standalone (local-only)** — sync stores conversations in a local
+  buffer inside the extension. Works the moment you install. To get
+  the markdown files on disk, click **Export to disk** from the popup;
+  the OS save dialog lets you pick any folder, and the export ships
+  as a zip alongside a folder README that tells your local AI agent
+  (Claude Code, Cursor, Codex, …) how to use the files. Multi-source
+  users export per-source — this is intentional friction; the
+  smoother path is Miyo.
 - **With [Miyo](https://miyo.md) installed** — files land in a
-  folder *you choose*, on your machine. Miyo indexes them for
-  **semantic search** and serves them over **MCP**, so your favorite
-  AI app — ChatGPT and Claude.ai in the cloud, Claude Code and
-  Cursor locally — can query your full history on demand. Miyo
-  doesn't see the contents; it only opens a local door for the AI to
-  read through.
+  folder *you choose*, on your machine, the moment you sync. Miyo
+  indexes them for **semantic search** and serves them over **MCP**,
+  so your favorite AI app — ChatGPT and Claude.ai in the cloud,
+  Claude Code and Cursor locally — can query your full history on
+  demand. Miyo doesn't see the contents; it only opens a local door
+  for the AI to read through.
 
-Install Miyo later and your next sync routes through the richer
-transport automatically. No setting, no toggle.
+Install Miyo after a few standalone syncs, and the popup offers a
+one-click **Send to Miyo** that replays the buffered conversations
+into Miyo's library. From then on, every sync streams straight
+through. No setting, no toggle.
 
 ## Output format
 
 Each conversation lands at
 `<dest>/<source>/<YYYY-MM-DD> <title> (<shortId>).md`, where
-`<dest>` is the folder you chose in Miyo (Miyo mode) or
-`~/Downloads/Miyo` (standalone mode). The file contains:
+`<dest>` is the folder you chose in Miyo (Miyo mode) or the folder
+you pick in the OS save dialog when you click Export (standalone
+mode). The file contains:
 
 - YAML frontmatter with `platform`, `conversation_id`, `title`,
   `url`, `created_at`, `updated_at`.
@@ -80,8 +87,8 @@ reads as one corpus rather than per-vendor formats.
   "an automated bot."
 - **Local only.** Conversation data never leaves your machine.
   Cookies and access tokens stay inside the browser. Markdown is
-  delivered either to your `Downloads` folder or to the Miyo
-  desktop app on `127.0.0.1` — never to a server we control.
+  buffered locally (IndexedDB) or streamed to the Miyo desktop app
+  on `127.0.0.1` — never to a server we control.
 - **Bulk + incremental.** First sync pulls everything. Every sync
   after that pulls only what's new (cursor by `updated_at`).
   Renamed conversations are handled in Miyo mode via stable IDs.

@@ -169,9 +169,11 @@ share conventions can.
 - **Pacing.** Every adapter call goes through a per-site rate
   limiter with a 1.5s floor between requests. You cannot opt out.
 
-- **File writes.** Don't touch the file system. The framework writes
-  the body (chat-rendered or custom-rendered) to
-  `<library>/<adapter.subdir>/<filename>`.
+- **Delivery.** Don't touch the file system. The framework hands the
+  body (chat-rendered or custom-rendered) to whichever transport is
+  active for the run: Miyo HTTP when the desktop is running, or the
+  local IndexedDB buffer otherwise. The user explicitly exports the
+  buffer to a zip via the popup.
 
 - **Idempotency and renames.** Same item id with same content state
   must produce the same filename. Re-fetches overwrite the existing

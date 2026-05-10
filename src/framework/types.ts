@@ -130,6 +130,11 @@ export interface PopupSnapshot {
     session: SiteSession | null;
     last_sync_at: number | null;
     last_sync_error: string | null;
+    // Items currently held in the local buffer for this source.
+    // Drives the per-row "N conversations buffered locally" line and
+    // gates the Export / Replay actions.
+    buffered_count: number;
+    last_exported_at: number | null;
   }>;
   active_sync: {
     site: SiteId;

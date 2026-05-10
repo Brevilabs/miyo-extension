@@ -2,12 +2,15 @@
 //
 // Responsibilities:
 //   1. Snapshot building for the popup (transport availability +
-//      per-site session/sync state).
+//      per-site session + buffer counts).
 //   2. Session probing — runs each adapter's probeSession on
 //      startup, install, and on popup-driven refresh.
 //   3. The sync orchestrator's host. The popup opens a port named
 //      'sync' and tells us which site to sync; we run runSync and
 //      pipe progress back over the port.
+//   4. The buffer→Miyo replay host. Same port, different message
+//      type. Replay only runs when Miyo is reachable; the popup
+//      gates the button on that state.
 //
 // We deliberately do NOT auto-sync. The only trigger is a user
 // clicking Sync now in the popup. There are no alarms, no cookie
@@ -15,21 +18,30 @@
 
 import { ADAPTERS, getAdapter } from '../adapters/index.js';
 import { runSync } from '../framework/sync.js';
+import { runBufferReplay } from '../framework/replay.js';
 import { getSiteState, patchSiteState } from '../framework/state.js';
+import { getAllSources } from '../framework/buffer.js';
 import { snapshotTransports } from '../framework/transports/index.js';
-import type { PopupSnapshot } from '../framework/types.js';
+import type { PopupSnapshot, SiteId } from '../framework/types.js';
 
 async function buildSnapshot(): Promise<PopupSnapshot> {
-  const transports = await snapshotTransports();
+  const [transports, bufferedSources] = await Promise.all([
+    snapshotTransports(),
+    getAllSources(),
+  ]);
+  const buffersById = new Map(bufferedSources.map((s) => [s.source_id, s]));
   const sites = await Promise.all(
     ADAPTERS.map(async (a) => {
       const s = await getSiteState(a.id);
+      const buf = buffersById.get(a.id);
       return {
         id: a.id,
         label: a.label,
         session: s.last_session,
         last_sync_at: s.last_sync_at,
         last_sync_error: s.last_sync_error,
+        buffered_count: buf?.item_count ?? 0,
+        last_exported_at: buf?.last_exported_at ?? null,
       };
     })
   );
@@ -79,7 +91,7 @@ chrome.runtime.onConnect.addListener((port) => {
     try {
       port.postMessage(msg);
     } catch {
-      // Popup closed — sync continues silently to completion.
+      // Popup closed — work continues silently to completion.
     }
   };
   port.onDisconnect.addListener(() => {
@@ -87,24 +99,39 @@ chrome.runtime.onConnect.addListener((port) => {
   });
 
   port.onMessage.addListener((msg) => {
-    if (msg?.type !== 'start' || typeof msg.site !== 'string') return;
-    const adapter = getAdapter(msg.site);
-    if (!adapter) {
-      safePost({
-        type: 'done',
-        site: msg.site,
-        result: { kind: 'aborted', reason: 'unknown_site' },
-      });
+    if (msg?.type === 'start' && typeof msg.site === 'string') {
+      const adapter = getAdapter(msg.site);
+      if (!adapter) {
+        safePost({
+          type: 'done',
+          site: msg.site,
+          result: { kind: 'aborted', reason: 'unknown_site' },
+        });
+        return;
+      }
+      void (async () => {
+        const result = await runSync(adapter, {
+          onProgress: ({ completed, total, mode }) => {
+            safePost({ type: 'progress', site: adapter.id, completed, total, mode });
+          },
+        });
+        safePost({ type: 'done', site: adapter.id, result });
+      })();
       return;
     }
-    void (async () => {
-      const result = await runSync(adapter, {
-        onProgress: ({ completed, total, mode }) => {
-          safePost({ type: 'progress', site: adapter.id, completed, total, mode });
-        },
-      });
-      safePost({ type: 'done', site: adapter.id, result });
-    })();
+
+    if (msg?.type === 'replay' && typeof msg.site === 'string') {
+      const site = msg.site as SiteId;
+      void (async () => {
+        const result = await runBufferReplay(site, {
+          onProgress: ({ completed, total }) => {
+            safePost({ type: 'replay-progress', site, completed, total });
+          },
+        });
+        safePost({ type: 'replay-done', site, result });
+      })();
+      return;
+    }
   });
 });
 
