@@ -1,16 +1,16 @@
 {
   "manifest_version": 3,
-  "name": "Miyo",
+  "name": "Miyo Sync",
   "short_name": "Miyo",
-  "version": "0.4.0",
-  "description": "Capture your ChatGPT and Claude conversations as local markdown. Works standalone — saves to Downloads. With Miyo installed, files land in your library and become searchable.",
+  "version": "0.1.0",
+  "description": "Sync AI chats (ChatGPT, Claude — more coming) to local markdown in your folder. With Miyo: semantic search + query from any AI.",
   "icons": {
     "16": "icons/icon-16.png",
     "48": "icons/icon-48.png",
     "128": "icons/icon-128.png"
   },
   "action": {
-    "default_title": "Miyo",
+    "default_title": "Miyo Sync",
     "default_popup": "popup.html",
     "default_icon": {
       "16": "icons/icon-16.png",

@@ -1,7 +1,7 @@
 {
   "name": "miyo-extension",
-  "version": "0.4.0",
-  "description": "Capture your AI chat history (ChatGPT, Claude) into local markdown files for Miyo and any tool that reads markdown.",
+  "version": "0.1.0",
+  "description": "Sync your AI chat history (ChatGPT, Claude) into local markdown files for Miyo and any tool that reads markdown.",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -10,7 +10,8 @@
     "build:watch": "node scripts/build.mjs --watch",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src --ext .ts",
-    "package": "npm run build && node scripts/package.mjs"
+    "package": "npm run build && node scripts/package.mjs",
+    "version": "node scripts/sync-version.mjs"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.270",

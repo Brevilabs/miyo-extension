@@ -40,6 +40,30 @@ gotchas. The short version:
   keeps the extension framed as the user porting their own data
   rather than an automated bot.
 
+## Cutting a release
+
+Releases are GitHub-driven. A push of a `v*.*.*` tag triggers
+`.github/workflows/release.yml` which builds, packages, and creates
+a GitHub Release with the `.zip` attached for Chrome Web Store
+upload.
+
+```bash
+# from main, after merging the changes you want to ship
+git checkout main && git pull
+npm version patch          # or minor / major — bumps package.json,
+                           # syncs public/manifest.json, commits, tags
+git push --follow-tags     # pushes the commit AND the tag
+```
+
+The workflow refuses to release if the tag doesn't match the
+versions in `package.json` and `public/manifest.json` — `npm version`
+keeps both aligned via `scripts/sync-version.mjs`.
+
+After the workflow succeeds, the Release page has the
+`miyo-extension-<version>.zip` ready to upload to the Chrome Web
+Store / Firefox Add-ons consoles. Auto-publish to those stores is
+not wired up yet (needs store API credentials).
+
 ## Bug reports
 
 Open an issue with:
