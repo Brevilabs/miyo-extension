@@ -2,7 +2,7 @@
 // Sync orchestrator picks one at the start of each run and uses it for
 // every per-item delivery in that run.
 
-export type TransportMode = 'miyo' | 'downloads';
+export type TransportMode = 'miyo' | 'buffer';
 
 export interface TransportHealth {
   available: boolean;
