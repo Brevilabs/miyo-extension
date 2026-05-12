@@ -1,7 +1,7 @@
 // Per-site state and in-progress sync persistence.
 //
-// chrome.storage.local survives browser restarts, so cursor and
-// filename map persist across sessions. SyncProgress also persists —
+// chrome.storage.local survives browser restarts, so cursor and last
+// sync outcome persist across sessions. SyncProgress also persists —
 // a service-worker kill mid-sync resumes from this exact state on
 // the next user click.
 
@@ -9,7 +9,6 @@ import type { SiteId, SiteState, SyncProgress } from './types.js';
 
 const EMPTY_STATE: SiteState = {
   cursor_updated_at: null,
-  filenames: {},
   last_session: null,
   last_probe_at: null,
   last_sync_at: null,
@@ -59,8 +58,8 @@ export async function setSyncProgress(
   }
 }
 
-// Wipe all state for a site. Used when the user resets a connector
-// (e.g. signs out and wants to start fresh).
+// Wipe all state for a site. Used when the user disables a connector
+// and the caller wants a clean slate on next enable.
 export async function resetSiteState(siteId: SiteId): Promise<void> {
   await chrome.storage.local.remove([stateKey(siteId), progressKey(siteId)]);
 }

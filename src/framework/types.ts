@@ -1,7 +1,6 @@
 // Cross-cutting types shared by the framework, adapters, and UI.
 
 import type { ChatConversation } from './chat.js';
-import type { TransportSnapshot } from './transports/index.js';
 
 export type SiteId = string;
 
@@ -29,10 +28,10 @@ export interface ItemListPage {
 }
 
 // What a custom adapter returns from fetchItem. The framework forwards
-// `body` to the active transport with the given `filename`.
+// `body` to the writer with the given `filename`.
 //
 // `filename` MUST be deterministic: the same item id with the same
-// content state must always produce the same filename, so re-deliveries
+// content state must always produce the same filename, so re-writes
 // overwrite cleanly.
 export interface RenderedItem {
   filename: string;
@@ -44,18 +43,14 @@ interface BaseSiteAdapter {
   id: SiteId;
   label: string;
 
-  // Subdirectory hint used by the downloads transport
-  // (Downloads/Miyo/<subdir>/...) and as a documentation aid for
-  // Miyo's per-source destination convention. Conventionally `<id>/`.
-  subdir: string;
-
   // The site's home page; used for "open ChatGPT" / "open Claude"
-  // affordances and as the public link in the folder README.
+  // affordances and recorded in the destination folder's
+  // .miyo-capture.json for tools that consume the folder.
   home_url: string;
 
-  // Optional display metadata forwarded to the Miyo desktop on
-  // sync/start so desktop can render any source_id without a
-  // release. Keep these stable per source.
+  // Optional display metadata recorded in the destination folder's
+  // .miyo-capture.json so any consumer (Miyo Desktop, future tools)
+  // can render the source without a hardcoded list.
   brand_color?: string; // hex, e.g. "#10a37f"
   icon_data_url?: string; // inline SVG as a data: URL
 
@@ -71,7 +66,7 @@ interface BaseSiteAdapter {
 
 // Chat-shaped adapter. Submits a normalized ChatConversation; the
 // framework derives the filename and renders the markdown. This keeps
-// chat output uniform across every chat provider so a Miyo library
+// chat output uniform across every chat provider so a captured folder
 // reads as one corpus rather than per-vendor formats.
 export interface ChatSiteAdapter extends BaseSiteAdapter {
   kind: 'chat';
@@ -88,19 +83,25 @@ export interface CustomSiteAdapter extends BaseSiteAdapter {
 
 export type SiteAdapter = ChatSiteAdapter | CustomSiteAdapter;
 
-// Per-site, per-installation persistent state. Survives browser
-// restarts. Stored in chrome.storage.local under `state:<siteId>`.
+// Per-site, per-installation persistent state in chrome.storage.local
+// under `state:<siteId>`. Survives browser restarts.
+//
+// Note: the captures map (which conversations have been written) is
+// NOT here — it lives in .miyo-capture.json inside the destination
+// folder, which is the source of truth for dedup. SiteState only
+// holds things that don't belong in the destination folder.
 export interface SiteState {
-  // Highest `updated_at` we have successfully synced. Drives delta
-  // sync — we only fetch items newer than this on subsequent runs.
-  // Null before the first successful sync.
+  // Highest `updated_at` we have successfully synced (only advances
+  // when a sync run finishes; partial runs leave it unchanged).
+  // SyncProgress.pending_ids handles intra-run resumability.
+  //
+  // Mirrors sync.cursor_updated_at in .miyo-capture.json. On Chrome
+  // the meta file is authoritative; on Firefox/Safari (downloads-only,
+  // no read-back) this is the only record.
   cursor_updated_at: string | null;
 
-  // Map from item id → last-delivered filename.
-  filenames: Record<string, string>;
-
-  // Last sign-in probe result, cached for popup display so it doesn't
-  // wait on a network call to render.
+  // Last sign-in probe, cached for popup display so it doesn't wait
+  // on a network call to render.
   last_session: SiteSession | null;
   last_probe_at: number | null;
 
@@ -122,23 +123,39 @@ export interface SyncProgress {
   list_exhausted: boolean;
 }
 
+// Per-site row in the popup. Composes config (enabled / paused /
+// destination), state (session, last sync), and folder-derived info
+// (capture count from meta).
+export interface SiteRowSnapshot {
+  id: SiteId;
+  label: string;
+  home_url: string;
+
+  // Config
+  enabled: boolean;
+  paused: boolean;
+  destination_kind: 'folder' | 'downloads' | null;
+  destination_label: string | null; // e.g. "Notes/ChatGPT" or "~/Downloads/Miyo Captures/ChatGPT"
+  destination_missing: boolean; // handle gone from IndexedDB — destination must be re-picked
+  destination_needs_reauth: boolean; // handle present but permission not granted this session
+
+  // Folder-derived (null on downloads-only browsers where we can't read)
+  captures_count: number | null;
+
+  // Session + sync history
+  session: SiteSession | null;
+  last_sync_at: number | null;
+  last_sync_error: string | null;
+}
+
 export interface PopupSnapshot {
-  transports: TransportSnapshot;
-  sites: Array<{
-    id: SiteId;
-    label: string;
-    session: SiteSession | null;
-    last_sync_at: number | null;
-    last_sync_error: string | null;
-    // Items currently held in the local buffer for this source.
-    // Drives the per-row "N conversations buffered locally" line and
-    // gates the Export / Replay actions.
-    buffered_count: number;
-    last_exported_at: number | null;
-  }>;
+  sites: SiteRowSnapshot[];
   active_sync: {
     site: SiteId;
     completed: number;
     total: number | null;
   } | null;
 }
+// Note: showDirectoryPicker capability is checked in the popup (window
+// context), not here — the background service worker is a
+// ServiceWorkerGlobalScope and never has the API regardless of browser.

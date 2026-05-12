@@ -1,7 +1,7 @@
 {
-  "name": "miyo-extension",
+  "name": "miyo-capture",
   "version": "0.1.0",
-  "description": "Sync your AI chat history (ChatGPT, Claude) into local markdown files for Miyo and any tool that reads markdown.",
+  "description": "Capture your AI chats (ChatGPT, Claude) as local markdown in a folder you choose. Use them with Miyo, Obsidian, or any tool that reads markdown.",
   "private": true,
   "license": "MIT",
   "type": "module",

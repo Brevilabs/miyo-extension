@@ -34,8 +34,6 @@ async function copyStatic() {
   await cp(resolve(ROOT, 'public'), DIST, { recursive: true });
   await cp(resolve(ROOT, 'src/popup/popup.html'), resolve(DIST, 'popup.html'));
   await cp(resolve(ROOT, 'src/popup/popup.css'), resolve(DIST, 'popup.css'));
-  await cp(resolve(ROOT, 'src/export/export.html'), resolve(DIST, 'export.html'));
-  await cp(resolve(ROOT, 'src/export/export.css'), resolve(DIST, 'export.css'));
 }
 
 async function build() {
@@ -52,11 +50,6 @@ async function build() {
       ...sharedOptions,
       entryPoints: [resolve(ROOT, 'src/popup/index.ts')],
       outfile: resolve(DIST, 'popup.js'),
-    }),
-    esbuild.context({
-      ...sharedOptions,
-      entryPoints: [resolve(ROOT, 'src/export/index.ts')],
-      outfile: resolve(DIST, 'export.js'),
     }),
   ]);
 

@@ -3,49 +3,56 @@
 // Vanilla DOM, no framework — keeps the extension lean and
 // review-friendly.
 //
-// What the popup shows:
-//   1. Transport status banner. Miyo connected → "Saving to Miyo".
-//      Miyo not running → standalone-buffer pitch with a "Get Miyo"
-//      link as the primary CTA. The pitch is the conversion lever;
-//      keep it present, not animated, no modal (extension.md:159).
-//   2. Per-site row. Sign-in state, last sync time, sync button.
-//      When the local buffer for that source has items, an actions
-//      row appears underneath: "Send to Miyo" (only when Miyo is
-//      reachable — replays the buffer through the HTTP transport)
-//      and "Export to disk" (always present in standalone, opens
-//      the export tab to emit a zip via chrome.downloads with a
-//      saveAs picker).
+// One screen, one concept: the list of supported sites. Each site is
+// either enabled (with a destination, a capture count, and a sync
+// button), paused, or not-yet-enabled. The enable flow opens a modal
+// that asks for a destination folder (Chromium) or confirms the
+// downloads-folder default (Firefox/Safari).
 //
-// Sync writes to the local buffer (or to Miyo over HTTP). It never
-// auto-writes to disk. Disk only happens via explicit Export.
+// The popup writes config directly to chrome.storage.local and
+// IndexedDB via the destinations module — the background service
+// worker mediates only sync runs.
 
-import type { PopupSnapshot, SiteId } from '../framework/types.js';
-import type { TransportMode } from '../framework/transports/index.js';
+import {
+  getSiteConfig,
+  setSiteConfig,
+  setFolderHandle,
+  requestPermission,
+  hasPermission,
+  getFolderHandle,
+  supportsFolderPicker,
+  defaultDownloadsSubpath,
+} from '../framework/destinations.js';
+import { META_FILENAME, parseMeta } from '../framework/meta.js';
+import type {
+  PopupSnapshot,
+  SiteId,
+  SiteRowSnapshot,
+} from '../framework/types.js';
+
+// ──────────────────────────────────────────────────────────────────
+// Types for messages from background
+// ──────────────────────────────────────────────────────────────────
 
 type SyncDone = {
   type: 'done';
   site: SiteId;
   result:
-    | { kind: 'completed'; written: number; errors: number; mode: TransportMode }
-    | { kind: 'paused'; written: number; reason: string; mode: TransportMode }
+    | { kind: 'completed'; written: number; errors: number }
+    | { kind: 'paused'; written: number; reason: string }
     | { kind: 'aborted'; reason: string };
 };
 
-type ReplayDone = {
-  type: 'replay-done';
-  site: SiteId;
-  result:
-    | { kind: 'completed'; replayed: number }
-    | { kind: 'aborted'; reason: string; replayed: number };
-};
+// ──────────────────────────────────────────────────────────────────
+// UI state
+// ──────────────────────────────────────────────────────────────────
 
 interface UIState {
   snapshot: PopupSnapshot | null;
   initializing: boolean;
   syncing: SiteId | null;
-  syncProgress: { completed: number; total: number | null; mode: TransportMode } | null;
-  replaying: SiteId | null;
-  replayProgress: { completed: number; total: number } | null;
+  syncProgress: { completed: number; total: number | null } | null;
+  enableModal: { siteId: SiteId; label: string; error: string | null } | null;
   banner: { kind: 'info' | 'error'; text: string } | null;
 }
 
@@ -54,23 +61,15 @@ const ui: UIState = {
   initializing: true,
   syncing: null,
   syncProgress: null,
-  replaying: null,
-  replayProgress: null,
+  enableModal: null,
   banner: null,
 };
 
 const root = document.getElementById('root')!;
 
-function fmtTime(ts: number | null): string {
-  if (!ts) return 'Never';
-  const diff = Date.now() - ts;
-  if (diff < 60_000) return 'Just now';
-  const min = Math.floor(diff / 60_000);
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  return new Date(ts).toLocaleDateString();
-}
+// ──────────────────────────────────────────────────────────────────
+// Helpers
+// ──────────────────────────────────────────────────────────────────
 
 function escape(s: string): string {
   return s.replace(/[&<>"']/g, (c) =>
@@ -86,195 +85,381 @@ function escape(s: string): string {
   );
 }
 
-function transportBlock(): string {
-  if (!ui.snapshot) return '';
-  const t = ui.snapshot.transports;
-  if (t.active === 'miyo') {
-    const label = t.miyo.label ?? 'Miyo';
-    return `
-      <div class="banner ok">
-        <div class="row">
-          <span class="muted">Connected to ${escape(label)} · indexed for search</span>
-        </div>
-      </div>`;
-  }
-  if (t.active === 'buffer') {
-    return `
-      <div class="banner">
-        <div class="row">
-          <span><strong>Local-only mode.</strong> <span class="muted">Sync stores locally; export by hand.</span></span>
-          <a href="https://miyo.md" target="_blank" rel="noopener">Get Miyo</a>
-        </div>
-        <div class="row sub">
-          <span class="muted">Install Miyo to stream syncs into an indexed library and query your history from any AI via MCP.</span>
-        </div>
-      </div>`;
-  }
-  return `
-    <div class="banner">
-      <span class="error">No delivery transport available. Reload the extension and try again.</span>
-    </div>`;
+function fmtTime(ts: number | null): string {
+  if (!ts) return 'never';
+  const diff = Date.now() - ts;
+  if (diff < 60_000) return 'just now';
+  const min = Math.floor(diff / 60_000);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  return new Date(ts).toLocaleDateString();
 }
 
-function renderSiteRow(s: PopupSnapshot['sites'][number]): string {
-  if (!ui.snapshot) return '';
-  const transportOk = ui.snapshot.transports.active !== null;
-  const miyoActive = ui.snapshot.transports.active === 'miyo';
-  const signedIn = !!s.session?.signedIn;
+// Browser global type bridge for showDirectoryPicker. The popup runs
+// in an extension page context which has `window`; the global cast
+// keeps this file portable.
+interface DirectoryPickerOptions {
+  mode?: 'read' | 'readwrite';
+  id?: string;
+  startIn?: 'desktop' | 'documents' | 'downloads' | 'music' | 'pictures' | 'videos';
+}
+type ShowDirectoryPicker = (opts?: DirectoryPickerOptions) => Promise<FileSystemDirectoryHandle>;
+
+// ──────────────────────────────────────────────────────────────────
+// Rendering
+// ──────────────────────────────────────────────────────────────────
+
+function renderSiteRow(s: SiteRowSnapshot): string {
   const isSyncing = ui.syncing === s.id;
-  const isReplaying = ui.replaying === s.id;
-  const anyBusy = ui.syncing !== null || ui.replaying !== null;
-  const syncDisabled = !transportOk || !signedIn || (anyBusy && !isSyncing);
+  const anyBusy = ui.syncing !== null;
+
+  if (!s.enabled) {
+    return `
+      <div class="site-row">
+        <div class="header">
+          <span class="label">${escape(s.label)}</span>
+          <button class="small" data-action="enable" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Enable →</button>
+        </div>
+        <div class="meta muted">Save your ${escape(s.label)} conversations as markdown.</div>
+      </div>`;
+  }
+
+  // Enabled
+  const statusDot = s.paused
+    ? '⏸'
+    : s.destination_missing
+      ? '⚠'
+      : s.destination_needs_reauth
+        ? '○'
+        : '●';
+  const dest = s.destination_missing
+    ? '<span class="error">folder no longer available</span>'
+    : s.destination_label
+      ? `<span class="muted">→ ${escape(s.destination_label)}</span>`
+      : '<span class="muted">→ no destination</span>';
 
   const meta: string[] = [];
-  if (signedIn) {
-    meta.push(`<div class="meta">${escape(s.session?.email ?? 'Signed in')}</div>`);
-  } else {
+  if (s.session?.signedIn) {
     meta.push(
-      `<div class="meta muted">Not signed in. Open ${escape(s.label)} in a tab and sign in, then click Refresh.</div>`
+      `<div class="meta">${s.session.email ? `Signed in as ${escape(s.session.email)}` : 'Signed in'}</div>`
+    );
+  } else if (s.session) {
+    meta.push(
+      `<div class="meta muted">Not signed in. Open ${escape(s.label)} in a tab and sign in.</div>`
     );
   }
-  meta.push(`<div class="meta">Last sync: ${fmtTime(s.last_sync_at)}</div>`);
-  if (s.buffered_count > 0) {
-    const exported = s.last_exported_at ? ` · exported ${fmtTime(s.last_exported_at)}` : '';
+
+  const countPart =
+    s.captures_count !== null
+      ? `${s.captures_count} capture${s.captures_count === 1 ? '' : 's'}`
+      : null;
+  const lastSyncPart = `last sync ${fmtTime(s.last_sync_at)}`;
+  const detail = countPart ? `${countPart} · ${lastSyncPart}` : lastSyncPart;
+  meta.push(`<div class="meta">${detail}</div>`);
+
+  if (s.destination_needs_reauth) {
     meta.push(
-      `<div class="bufinfo">${s.buffered_count} conversation${s.buffered_count === 1 ? '' : 's'} buffered locally${exported}</div>`
+      `<div class="meta muted">Needs folder access for this session — click Sync to grant.</div>`
     );
-  }
-  if (s.last_sync_error) {
-    meta.push(`<div class="err"><span class="error">${escape(s.last_sync_error)}</span></div>`);
+  } else if (s.last_sync_error && s.last_sync_error !== 'permission_revoked') {
+    meta.push(
+      `<div class="err"><span class="error">${escape(explainAbort(s.last_sync_error))}</span></div>`
+    );
   }
 
   let progress = '';
   if (isSyncing && ui.syncProgress) {
     const { completed, total } = ui.syncProgress;
     progress = total
-      ? `<div class="progress">Fetched ${completed} of ${total}</div>`
-      : `<div class="progress">Fetched ${completed}</div>`;
-  } else if (isReplaying && ui.replayProgress) {
-    const { completed, total } = ui.replayProgress;
-    progress = `<div class="progress">Sending ${completed} of ${total} to Miyo…</div>`;
+      ? `<div class="progress">Syncing ${completed} of ${total}…</div>`
+      : `<div class="progress">Syncing ${completed}…</div>`;
   }
 
-  const syncBtnLabel = isSyncing ? 'Syncing…' : 'Sync';
-  let actions = '';
-  if (s.buffered_count > 0 && !isSyncing && !isReplaying) {
-    const parts: string[] = [];
-    if (miyoActive) {
-      parts.push(
-        `<button class="primary small" data-action="replay" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Send to Miyo</button>`
+  // Actions row
+  const actions: string[] = [];
+  if (s.destination_missing) {
+    actions.push(
+      `<button class="primary small" data-action="reconnect" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Reconnect</button>`
+    );
+  } else if (s.paused) {
+    actions.push(
+      `<button class="primary small" data-action="resume" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Resume</button>`
+    );
+  } else {
+    const syncDisabled = anyBusy && !isSyncing;
+    actions.push(
+      `<button class="primary small" data-action="sync" data-site="${escape(s.id)}" ${syncDisabled ? 'disabled' : ''}>${isSyncing ? 'Syncing…' : 'Sync now'}</button>`
+    );
+    if (!isSyncing) {
+      actions.push(
+        `<button class="link" data-action="pause" data-site="${escape(s.id)}">Pause</button>`
       );
     }
-    parts.push(
-      `<button class="link" data-action="export" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Export to disk</button>`
+  }
+  if (!isSyncing) {
+    actions.push(
+      `<button class="link" data-action="change-destination" data-site="${escape(s.id)}">Change folder</button>`
     );
-    actions = `<div class="actions">${parts.join('')}</div>`;
+    actions.push(
+      `<button class="link" data-action="disable" data-site="${escape(s.id)}">Disable</button>`
+    );
   }
 
   return `
     <div class="site-row">
       <div class="header">
-        <span class="label">${escape(s.label)}</span>
-        <button class="small" data-action="sync" data-site="${escape(s.id)}" ${syncDisabled ? 'disabled' : ''}>${syncBtnLabel}</button>
+        <span class="label">${statusDot} ${escape(s.label)}${s.paused ? ' (paused)' : ''}</span>
+        ${dest}
       </div>
       ${meta.join('')}
       ${progress}
-      ${actions}
+      <div class="actions">${actions.join('')}</div>
     </div>`;
 }
 
-function renderSites(): string {
-  if (!ui.snapshot) return '';
-  return ui.snapshot.sites.map(renderSiteRow).join('');
+function renderEnableModal(): string {
+  if (!ui.enableModal) return '';
+  const { label, error } = ui.enableModal;
+  // Capability check must run in the popup (window context) — the
+  // background service worker is a ServiceWorkerGlobalScope and never
+  // has showDirectoryPicker, regardless of browser.
+  const canPickFolder = supportsFolderPicker();
+
+  const body = canPickFolder
+    ? `
+        <p class="muted">Pick a folder on your computer. Your ${escape(label)} captures will be saved there as one markdown file per conversation.</p>
+        <div class="actions">
+          <button class="primary" data-action="modal-pick-folder">Choose folder</button>
+          <button class="link" data-action="modal-cancel">Cancel</button>
+        </div>`
+    : `
+        <p class="muted">Your browser doesn't support folder selection. ${escape(label)} captures will be saved to your Downloads folder:</p>
+        <p><code>~/Downloads/${escape(defaultDownloadsSubpath(label))}</code></p>
+        <div class="actions">
+          <button class="primary" data-action="modal-use-downloads">Save to Downloads</button>
+          <button class="link" data-action="modal-cancel">Cancel</button>
+        </div>`;
+
+  return `
+    <div class="modal-backdrop">
+      <div class="modal">
+        <h1>Enable ${escape(label)} capture</h1>
+        ${error ? `<p class="error">${escape(error)}</p>` : ''}
+        ${body}
+      </div>
+    </div>`;
 }
 
 function render(): void {
   if (ui.initializing) {
-    root.innerHTML = `<h1>Miyo</h1><p class="muted">Loading…</p>`;
+    root.innerHTML = `<h1>Miyo Capture</h1><p class="muted">Loading…</p>`;
     return;
   }
+  const sites = ui.snapshot?.sites ?? [];
+  const noneEnabled = sites.every((s) => !s.enabled);
+
   root.innerHTML = `
-    <h1>Miyo</h1>
+    <h1>Miyo Capture</h1>
     ${
       ui.banner
         ? `<div class="banner"><span class="${ui.banner.kind === 'error' ? 'error' : 'muted'}">${escape(ui.banner.text)}</span></div>`
         : ''
     }
-    ${transportBlock()}
-    <h2>Sites</h2>
-    ${renderSites()}
-    <footer>
-      <button class="link" data-action="refresh">Refresh</button>
-    </footer>
+    ${
+      noneEnabled
+        ? `<p class="muted">Capture your AI chats as local markdown. Pick a site to start.</p>`
+        : ''
+    }
+    ${sites.map(renderSiteRow).join('')}
+    ${renderEnableModal()}
   `;
 
   root.querySelectorAll<HTMLButtonElement>('button[data-action]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const action = btn.dataset.action;
       const site = btn.dataset.site as SiteId | undefined;
-      if (action === 'sync' && site) void onSync(site);
-      else if (action === 'replay' && site) void onReplay(site);
-      else if (action === 'export' && site) onExport(site);
-      else if (action === 'refresh') void onRefresh();
+      if (action === 'enable' && site) void onEnable(site);
+      else if (action === 'sync' && site) void onSync(site);
+      else if (action === 'pause' && site) void onPause(site);
+      else if (action === 'resume' && site) void onResume(site);
+      else if (action === 'disable' && site) void onDisable(site);
+      else if (action === 'reconnect' && site) void onReconnect(site);
+      else if (action === 'change-destination' && site) void onEnable(site);
+      else if (action === 'modal-pick-folder') void onPickFolder();
+      else if (action === 'modal-use-downloads') void onUseDownloads();
+      else if (action === 'modal-cancel') onModalCancel();
     });
   });
 }
 
-async function onSync(site: SiteId): Promise<void> {
-  ui.banner = null;
-  if (!ui.snapshot || ui.snapshot.transports.active === null) {
-    ui.banner = { kind: 'error', text: 'No delivery transport available.' };
+// ──────────────────────────────────────────────────────────────────
+// Actions
+// ──────────────────────────────────────────────────────────────────
+
+function findSite(siteId: SiteId): SiteRowSnapshot | null {
+  return ui.snapshot?.sites.find((s) => s.id === siteId) ?? null;
+}
+
+function onEnable(siteId: SiteId): void {
+  const s = findSite(siteId);
+  if (!s) return;
+  ui.enableModal = { siteId, label: s.label, error: null };
+  render();
+}
+
+function onModalCancel(): void {
+  ui.enableModal = null;
+  render();
+}
+
+async function onPickFolder(): Promise<void> {
+  if (!ui.enableModal) return;
+  const { siteId } = ui.enableModal;
+
+  const picker = (window as unknown as { showDirectoryPicker?: ShowDirectoryPicker })
+    .showDirectoryPicker;
+  if (!picker) {
+    ui.enableModal = { ...ui.enableModal, error: 'Folder picker not supported by this browser.' };
     render();
     return;
   }
 
-  ui.syncing = site;
-  ui.syncProgress = { completed: 0, total: null, mode: ui.snapshot.transports.active };
+  let handle: FileSystemDirectoryHandle;
+  try {
+    handle = await picker({
+      mode: 'readwrite',
+      id: `miyo-capture-${siteId}`,
+      startIn: 'documents',
+    });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      // User cancelled — keep modal open so they can retry or cancel.
+      return;
+    }
+    ui.enableModal = {
+      ...ui.enableModal,
+      error: err instanceof Error ? err.message : String(err),
+    };
+    render();
+    return;
+  }
+
+  // Conflict check: does the folder already belong to another source?
+  try {
+    const fh = await handle.getFileHandle(META_FILENAME);
+    const file = await fh.getFile();
+    const existing = parseMeta(await file.text());
+    if (existing && existing.source.id !== siteId) {
+      ui.enableModal = {
+        ...ui.enableModal,
+        error: `This folder already holds captures from ${existing.source.label}. Pick a different folder.`,
+      };
+      render();
+      return;
+    }
+  } catch (err) {
+    if (!(err instanceof DOMException && err.name === 'NotFoundError')) {
+      ui.enableModal = {
+        ...ui.enableModal,
+        error: err instanceof Error ? err.message : String(err),
+      };
+      render();
+      return;
+    }
+  }
+
+  await setFolderHandle(siteId, handle);
+  await setSiteConfig(siteId, {
+    enabled: true,
+    paused: false,
+    destination: { kind: 'folder' },
+  });
+  ui.enableModal = null;
+  ui.banner = null;
+  // Refresh first so the site row renders as enabled, then kick off
+  // the first sync. The user just told us where their data should go;
+  // they expect it to start arriving immediately.
+  await onRefresh();
+  void onSync(siteId);
+}
+
+async function onUseDownloads(): Promise<void> {
+  if (!ui.enableModal) return;
+  const { siteId, label } = ui.enableModal;
+  await setSiteConfig(siteId, {
+    enabled: true,
+    paused: false,
+    destination: { kind: 'downloads', subpath: defaultDownloadsSubpath(label) },
+  });
+  ui.enableModal = null;
+  ui.banner = null;
+  await onRefresh();
+  void onSync(siteId);
+}
+
+async function onSync(siteId: SiteId): Promise<void> {
+  ui.banner = null;
+
+  // For folder destinations, ensure permission is granted before
+  // handing off to the background. The popup click is a user gesture,
+  // so requestPermission can prompt here; the SW cannot. If permission
+  // is already granted, requestPermission returns 'granted' without
+  // any user-facing prompt.
+  const site = findSite(siteId);
+  if (site?.destination_kind === 'folder') {
+    const handle = await getFolderHandle(siteId);
+    if (handle && !(await hasPermission(handle))) {
+      const granted = await requestPermission(handle);
+      if (!granted) {
+        ui.banner = {
+          kind: 'error',
+          text: 'Folder access denied. Cannot sync until you grant access.',
+        };
+        render();
+        return;
+      }
+      // Permission state changed; reflect it in the snapshot.
+      site.destination_needs_reauth = false;
+    }
+  }
+
+  ui.syncing = siteId;
+  ui.syncProgress = { completed: 0, total: null };
   render();
 
   const port = chrome.runtime.connect({ name: 'sync' });
-  port.postMessage({ type: 'start', site });
+  port.postMessage({ type: 'start', site: siteId });
   port.onMessage.addListener((msg) => {
-    if (msg?.type === 'progress' && msg.site === site) {
-      ui.syncProgress = { completed: msg.completed, total: msg.total, mode: msg.mode };
+    if (msg?.type === 'progress' && msg.site === siteId) {
+      ui.syncProgress = { completed: msg.completed, total: msg.total };
       render();
     } else if (msg?.type === 'done') {
       const done = msg as SyncDone;
       ui.syncing = null;
       ui.syncProgress = null;
       if (done.result.kind === 'completed') {
-        const dest = done.result.mode === 'miyo' ? 'Miyo' : 'local buffer';
         ui.banner = {
           kind: 'info',
           text:
             done.result.errors > 0
-              ? `Synced ${done.result.written} to ${dest} (${done.result.errors} failed).`
-              : `Synced ${done.result.written} to ${dest}.`,
+              ? `Captured ${done.result.written} new (${done.result.errors} failed).`
+              : `Captured ${done.result.written} new.`,
         };
       } else if (done.result.kind === 'paused') {
         ui.banner = {
           kind: 'info',
-          text: `Paused at ${done.result.written}. Click Sync again to continue.`,
-        };
-      } else if (done.result.reason === 'miyo_unreachable') {
-        ui.banner = {
-          kind: 'error',
-          text: 'Miyo went away mid-sync. Restart it and click Sync to resume.',
-        };
-      } else if (done.result.reason === 'no_transport') {
-        ui.banner = {
-          kind: 'error',
-          text: 'No delivery transport available. Reload the extension and try again.',
+          text: `Paused at ${done.result.written}. Click Sync to continue.`,
         };
       } else {
-        ui.banner = { kind: 'error', text: `Sync stopped: ${done.result.reason}` };
+        ui.banner = { kind: 'error', text: explainAbort(done.result.reason) };
       }
       port.disconnect();
       void onRefresh();
     }
   });
   port.onDisconnect.addListener(() => {
-    if (ui.syncing === site) {
+    if (ui.syncing === siteId) {
       ui.syncing = null;
       ui.syncProgress = null;
       render();
@@ -282,65 +467,86 @@ async function onSync(site: SiteId): Promise<void> {
   });
 }
 
-async function onReplay(site: SiteId): Promise<void> {
-  ui.banner = null;
-  ui.replaying = site;
-  ui.replayProgress = { completed: 0, total: 0 };
-  render();
-
-  const port = chrome.runtime.connect({ name: 'sync' });
-  port.postMessage({ type: 'replay', site });
-  port.onMessage.addListener((msg) => {
-    if (msg?.type === 'replay-progress' && msg.site === site) {
-      ui.replayProgress = { completed: msg.completed, total: msg.total };
-      render();
-    } else if (msg?.type === 'replay-done') {
-      const done = msg as ReplayDone;
-      ui.replaying = null;
-      ui.replayProgress = null;
-      if (done.result.kind === 'completed') {
-        ui.banner = {
-          kind: 'info',
-          text:
-            done.result.replayed > 0
-              ? `Sent ${done.result.replayed} buffered conversation${done.result.replayed === 1 ? '' : 's'} to Miyo.`
-              : 'Buffer was already empty.',
-        };
-      } else if (done.result.reason === 'miyo_unreachable') {
-        ui.banner = {
-          kind: 'error',
-          text: `Miyo unreachable. Sent ${done.result.replayed} so far — restart Miyo and click again to resume.`,
-        };
-      } else {
-        ui.banner = {
-          kind: 'error',
-          text: `Replay stopped: ${done.result.reason}`,
-        };
+function explainAbort(reason: string): string {
+  switch (reason) {
+    case 'paused':
+      return 'This site is paused. Resume to sync.';
+    case 'not_enabled':
+      return 'This site is not enabled.';
+    case 'not_configured':
+      return 'Pick a destination folder first.';
+    case 'handle_missing':
+    case 'permission_revoked':
+      return 'Folder access lost. Reconnect to resume.';
+    case 'signed_out':
+      return 'You are signed out of this site. Sign in and try again.';
+    default:
+      if (reason.startsWith('destination_belongs_to_')) {
+        return `This folder is for another source (${reason.replace('destination_belongs_to_', '')}). Pick a different folder.`;
       }
-      port.disconnect();
-      void onRefresh();
-    }
-  });
-  port.onDisconnect.addListener(() => {
-    if (ui.replaying === site) {
-      ui.replaying = null;
-      ui.replayProgress = null;
-      render();
-    }
-  });
+      return `Sync stopped: ${reason}`;
+  }
 }
 
-function onExport(site: SiteId): void {
-  // Open the dedicated export tab. Doing this in a tab (rather than
-  // the popup itself) means the OS save dialog can't yank a closing
-  // popup out from under the in-flight blob URL.
-  const url = chrome.runtime.getURL(`export.html?source=${encodeURIComponent(site)}`);
-  void chrome.tabs.create({ url });
+async function onPause(siteId: SiteId): Promise<void> {
+  await setSiteConfig(siteId, { paused: true });
+  await onRefresh();
+}
+
+async function onResume(siteId: SiteId): Promise<void> {
+  await setSiteConfig(siteId, { paused: false });
+  await onRefresh();
+}
+
+async function onDisable(siteId: SiteId): Promise<void> {
+  const cfg = await getSiteConfig(siteId);
+  // Keep destination so re-enable is one click. Disable just sets the
+  // flag; nothing is deleted.
+  await setSiteConfig(siteId, { ...cfg, enabled: false, paused: false });
+  await onRefresh();
+}
+
+async function onReconnect(siteId: SiteId): Promise<void> {
+  const handle = await getFolderHandle(siteId);
+  if (!handle) {
+    // Handle is gone entirely — fall back to the enable flow.
+    onEnable(siteId);
+    return;
+  }
+  const ok = await requestPermission(handle);
+  if (!ok) {
+    ui.banner = { kind: 'error', text: 'Permission denied. The folder cannot be accessed.' };
+    render();
+    return;
+  }
+  await onRefresh();
+}
+
+// File System Access permissions can be 'granted' for the popup window
+// but reported differently from the service worker. The popup runs in
+// a real window context, so its hasPermission() answer is the truth.
+// We reconcile each folder site here so the UI reflects what writes
+// will actually be allowed to do.
+async function enrichPermissions(snapshot: PopupSnapshot): Promise<void> {
+  await Promise.all(
+    snapshot.sites.map(async (site) => {
+      if (!site.enabled || site.destination_kind !== 'folder') return;
+      const handle = await getFolderHandle(site.id);
+      if (!handle) {
+        site.destination_missing = true;
+        return;
+      }
+      // Handle is in IndexedDB but permission may need re-granting
+      // for this session — that's a soft state, not "missing."
+      site.destination_needs_reauth = !(await hasPermission(handle));
+    })
+  );
 }
 
 async function onRefresh(): Promise<void> {
   try {
-    ui.snapshot = (await chrome.runtime.sendMessage({ type: 'probe' })) as PopupSnapshot;
+    ui.snapshot = (await chrome.runtime.sendMessage({ type: 'snapshot' })) as PopupSnapshot;
+    if (ui.snapshot) await enrichPermissions(ui.snapshot);
   } catch (err) {
     ui.banner = { kind: 'error', text: err instanceof Error ? err.message : String(err) };
   }
@@ -351,6 +557,7 @@ async function init(): Promise<void> {
   render();
   try {
     ui.snapshot = (await chrome.runtime.sendMessage({ type: 'open' })) as PopupSnapshot;
+    if (ui.snapshot) await enrichPermissions(ui.snapshot);
   } catch (err) {
     ui.banner = { kind: 'error', text: err instanceof Error ? err.message : String(err) };
   } finally {

@@ -1,37 +1,38 @@
 // The single sync loop.
 //
 // Driven by the background service worker after the popup hands off a
-// "sync this site now" message. The orchestrator picks a transport at
-// the start (Miyo HTTP if running, downloads fallback otherwise),
-// then drives the same fetch-render-deliver loop regardless of which
-// transport is active. One run = one transport.
+// "sync this site now" message. Each run targets one site; the
+// destination is whatever the user configured. No transport selection
+// — there is exactly one delivery path per run: the writer for that
+// site.
 //
 // Correctness invariants:
 //
-//   1. The cursor (last successfully synced `updated_at`) only
+//   1. The destination folder is the source of truth. On Chrome the
+//      writer reads .miyo-capture.json at the start of the run and
+//      uses its captures map to skip already-delivered items. On
+//      Firefox/Safari (downloads-only), readMeta is null; we synthesize
+//      a fresh meta in memory and rely on the cursor in
+//      chrome.storage.local for delta sync.
+//
+//   2. The cursor (last successfully synced `updated_at`) only
 //      advances at the end of a fully-completed run. A partial run
 //      that gets interrupted leaves the cursor unchanged, and the
-//      next click resumes via `SyncProgress.pending_ids` — we do not
-//      re-deliver items we already wrote.
+//      next click resumes via `SyncProgress.pending_ids`.
 //
-//   2. SyncProgress is persisted after every individual successful
+//   3. SyncProgress is persisted after every individual successful
 //      delivery. A service-worker kill at any point loses at most
 //      one in-flight item.
 //
-//   3. Deliveries are idempotent. Adapter contract guarantees the
-//      same item id produces a deterministic filename. Re-deliveries
-//      overwrite (Miyo: by stable_id; Downloads: by overwrite
-//      conflictAction).
+//   4. Writes are idempotent. The adapter's filename is deterministic
+//      per item id; re-writes overwrite (folder: getFileHandle with
+//      create:true; downloads: conflictAction:'overwrite').
 //
-//   4. Listing is newest-first; the first item with
+//   5. Listing is newest-first; the first item with
 //      `updated_at <= cursor` lets us terminate paging early.
 //
-//   5. 401/403 from any site call stops the run and marks the source
+//   6. 401/403 from any site call stops the run and marks the source
 //      as signed-out.
-//
-//   6. MiyoUnreachableError from a Miyo-mode transport call stops
-//      the run cleanly; the user can install/start Miyo and click
-//      again to resume. State is preserved.
 
 import { FatalError, paced } from './rate-limit.js';
 import {
@@ -40,12 +41,15 @@ import {
   getSyncProgress,
   setSyncProgress,
 } from './state.js';
+import { getSiteConfig } from './destinations.js';
+import { makeWriter } from './writer.js';
 import {
-  selectTransport,
-  MiyoUnreachableError,
-  type Transport,
-  type TransportMode,
-} from './transports/index.js';
+  emptyMeta,
+  hasCapture,
+  mergeCapture,
+  type CaptureFolderMeta,
+  type SourceIdentity,
+} from './meta.js';
 import { renderChatConversationMarkdown } from './chat.js';
 import { makeDatePrefixedFilename } from './filename.js';
 import type { RenderedItem, SiteAdapter, SyncProgress } from './types.js';
@@ -55,13 +59,19 @@ import type { RenderedItem, SiteAdapter, SyncProgress } from './types.js';
 // an hour.
 const MAX_PER_RUN = 1000;
 
+// Per-item meta write would be O(N²) in serialized bytes for large
+// runs. Flush every K items to amortize while keeping crash-recovery
+// cost bounded — writes are idempotent (deterministic filenames +
+// overwrite), so re-fetching K items on a worst-case crash is cheap.
+const META_FLUSH_EVERY = 25;
+
 export interface SyncCallbacks {
-  onProgress: (p: { completed: number; total: number | null; mode: TransportMode }) => void;
+  onProgress: (p: { completed: number; total: number | null }) => void;
 }
 
 export type SyncResult =
-  | { kind: 'completed'; written: number; errors: number; mode: TransportMode }
-  | { kind: 'paused'; written: number; reason: 'cap_reached'; mode: TransportMode }
+  | { kind: 'completed'; written: number; errors: number }
+  | { kind: 'paused'; written: number; reason: 'cap_reached' }
   | { kind: 'aborted'; reason: string };
 
 function freshProgress(): SyncProgress {
@@ -76,13 +86,7 @@ function freshProgress(): SyncProgress {
   };
 }
 
-// Resolves an adapter's per-item render output. For chat adapters the
-// framework owns both filename and body; custom adapters bring their
-// own.
-async function renderForAdapter(
-  adapter: SiteAdapter,
-  id: string
-): Promise<RenderedItem> {
+async function renderForAdapter(adapter: SiteAdapter, id: string): Promise<RenderedItem> {
   if (adapter.kind === 'chat') {
     const conv = await adapter.fetchConversation(id);
     return {
@@ -97,39 +101,66 @@ async function renderForAdapter(
   return adapter.fetchItem(id);
 }
 
+function sourceIdentityFromAdapter(adapter: SiteAdapter): SourceIdentity {
+  return {
+    id: adapter.id,
+    label: adapter.label,
+    home_url: adapter.home_url,
+    ...(adapter.brand_color ? { brand_color: adapter.brand_color } : {}),
+  };
+}
+
+function writerVersion(): string {
+  try {
+    return chrome.runtime.getManifest().version;
+  } catch {
+    return 'unknown';
+  }
+}
+
 export async function runSync(
   adapter: SiteAdapter,
   callbacks: SyncCallbacks
 ): Promise<SyncResult> {
-  const resolved = await selectTransport();
-  if (!resolved) {
-    return { kind: 'aborted', reason: 'no_transport' };
+  const config = await getSiteConfig(adapter.id);
+  if (!config.enabled) return { kind: 'aborted', reason: 'not_enabled' };
+  if (config.paused) return { kind: 'aborted', reason: 'paused' };
+
+  const writerResult = await makeWriter(adapter.id, config);
+  if (!writerResult.ok) return { kind: 'aborted', reason: writerResult.reason };
+  const writer = writerResult.writer;
+  const isFolder = writer.kind === 'folder';
+
+  // Load existing meta or initialize. emptyMeta is used both on
+  // first-ever sync to a folder and on downloads-only browsers where
+  // readMeta cannot return real state.
+  const sourceIdentity = sourceIdentityFromAdapter(adapter);
+  let meta: CaptureFolderMeta =
+    (await writer.readMeta()) ?? emptyMeta(sourceIdentity, writerVersion());
+
+  // Defense in depth: the popup's destination setup should catch
+  // mismatched-source folders before we get here, but if a meta file
+  // exists for a different source, bail without writing.
+  if (meta.source.id !== adapter.id) {
+    return { kind: 'aborted', reason: `destination_belongs_to_${meta.source.id}` };
   }
-  const transport: Transport = resolved.transport;
+
+  // Refresh source identity (label, brand_color may evolve across
+  // extension releases).
+  meta = {
+    ...meta,
+    source: sourceIdentity,
+    writer_version: writerVersion(),
+  };
 
   const state = await getSiteState(adapter.id);
-  const progress = (await getSyncProgress(adapter.id)) ?? freshProgress();
-  const filenames = { ...state.filenames };
-  const cursorAt = state.cursor_updated_at;
+  // Folder is SoT: prefer meta's cursor. Fall back to state's cursor
+  // on downloads-only browsers (where readMeta returned null and meta
+  // is synthetic).
+  const cursorAt = meta.sync?.cursor_updated_at ?? state.cursor_updated_at;
   let highestSeen: string | null = cursorAt;
 
-  // Tell the transport we are starting (Miyo surfaces "syncing" in
-  // the Synced apps UI and caches display metadata; Downloads writes
-  // a folder README on first run / refreshes it after).
-  try {
-    await transport.postSyncStart(adapter.id, {
-      signed_in_email: state.last_session?.email ?? null,
-      label: adapter.label,
-      home_url: adapter.home_url,
-      brand_color: adapter.brand_color,
-      icon_data_url: adapter.icon_data_url,
-    });
-  } catch (err) {
-    if (err instanceof MiyoUnreachableError) {
-      return { kind: 'aborted', reason: 'miyo_unreachable' };
-    }
-    throw err;
-  }
+  const progress = (await getSyncProgress(adapter.id)) ?? freshProgress();
 
   const finalizeAsSignedOut = async (): Promise<SyncResult> => {
     await patchSiteState(adapter.id, {
@@ -138,14 +169,7 @@ export async function runSync(
       last_probe_at: Date.now(),
     });
     await setSyncProgress(adapter.id, null);
-    await transport
-      .postSyncFinish(adapter.id, {
-        written: progress.completed,
-        errors: progress.errors.length,
-        cursor_updated_at: cursorAt,
-        error_summary: 'signed_out',
-      })
-      .catch(() => {});
+    await writer.writeMeta(meta).catch(() => {});
     return { kind: 'aborted', reason: 'signed_out' };
   };
 
@@ -165,8 +189,12 @@ export async function runSync(
             hitCursor = true;
             break;
           }
-          progress.pending_ids.push(item.id);
+          // Advance highestSeen regardless of capture state — cursor
+          // should move past items we've already captured.
           if (!highestSeen || item.updated_at > highestSeen) highestSeen = item.updated_at;
+          // Skip items already in the captures map.
+          if (hasCapture(meta, item.id)) continue;
+          progress.pending_ids.push(item.id);
         }
         progress.list_exhausted = hitCursor || page.next_cursor === null;
         progress.list_cursor = page.next_cursor;
@@ -181,32 +209,35 @@ export async function runSync(
       const id = progress.pending_ids.shift()!;
       try {
         const rendered = await paced(adapter.id, () => renderForAdapter(adapter, id));
-        await transport.postItem(adapter.id, {
+        await writer.write(rendered.filename, rendered.body);
+
+        meta = mergeCapture(meta, id, {
           filename: rendered.filename,
-          body: rendered.body,
-          stable_id: id,
           updated_at: highestSeen,
         });
-
-        filenames[id] = rendered.filename;
         progress.completed += 1;
-
-        // Persist after every successful delivery so a SW restart
-        // loses at most the in-flight item.
-        await patchSiteState(adapter.id, { filenames });
         await setSyncProgress(adapter.id, progress);
-        callbacks.onProgress({
-          completed: progress.completed,
-          total: progress.total,
-          mode: transport.mode,
-        });
-      } catch (err) {
-        if (err instanceof MiyoUnreachableError) {
-          await patchSiteState(adapter.id, { last_sync_error: 'miyo_unreachable' });
-          return { kind: 'aborted', reason: 'miyo_unreachable' };
+
+        // On Chrome (folder writer), flush meta every META_FLUSH_EVERY
+        // items. On downloads-only browsers each writeMeta is a visible
+        // download — defer to end-of-run regardless.
+        if (isFolder && progress.completed % META_FLUSH_EVERY === 0) {
+          await writer.writeMeta(meta).catch(() => {
+            // Best-effort. Next flush retries.
+          });
         }
+
+        callbacks.onProgress({ completed: progress.completed, total: progress.total });
+      } catch (err) {
         if (err instanceof FatalError && (err.status === 401 || err.status === 403)) {
           return finalizeAsSignedOut();
+        }
+        // Permission lost mid-run — abort cleanly so the popup can
+        // prompt for reconnect rather than collecting N identical
+        // per-item errors.
+        if (err instanceof DOMException && err.name === 'NotAllowedError') {
+          await patchSiteState(adapter.id, { last_sync_error: 'permission_revoked' });
+          return { kind: 'aborted', reason: 'permission_revoked' };
         }
         const message = err instanceof Error ? err.message : String(err);
         progress.errors.push({ item_id: id, message });
@@ -215,24 +246,31 @@ export async function runSync(
     }
 
     const reachedCap = progress.completed >= MAX_PER_RUN && !progress.list_exhausted;
+    const nowIso = new Date().toISOString();
+    const sessionSnapshot = state.last_session
+      ? {
+          signed_in_email: state.last_session.email,
+          probed_at: state.last_probe_at
+            ? new Date(state.last_probe_at).toISOString()
+            : nowIso,
+        }
+      : meta.session;
+
+    meta = {
+      ...meta,
+      sync: {
+        last_at: nowIso,
+        cursor_updated_at: reachedCap ? cursorAt : highestSeen,
+      },
+      ...(sessionSnapshot ? { session: sessionSnapshot } : {}),
+    };
+
+    // Final meta flush. Redundant on Chrome after per-item writes;
+    // essential on downloads-only browsers (their only writeMeta call).
+    await writer.writeMeta(meta).catch(() => {});
+
     if (reachedCap) {
-      await transport
-        .postSyncFinish(adapter.id, {
-          written: progress.completed,
-          errors: progress.errors.length,
-          cursor_updated_at: cursorAt,
-          error_summary:
-            progress.errors.length > 0
-              ? `${progress.errors.length} item(s) failed; paused at cap`
-              : 'paused at cap',
-        })
-        .catch(() => {});
-      return {
-        kind: 'paused',
-        written: progress.completed,
-        reason: 'cap_reached',
-        mode: transport.mode,
-      };
+      return { kind: 'paused', written: progress.completed, reason: 'cap_reached' };
     }
 
     await patchSiteState(adapter.id, {
@@ -244,39 +282,22 @@ export async function runSync(
           : null,
     });
     await setSyncProgress(adapter.id, null);
-    await transport
-      .postSyncFinish(adapter.id, {
-        written: progress.completed,
-        errors: progress.errors.length,
-        cursor_updated_at: highestSeen,
-        error_summary:
-          progress.errors.length > 0 ? `${progress.errors.length} item(s) failed` : null,
-      })
-      .catch(() => {});
     return {
       kind: 'completed',
       written: progress.completed,
       errors: progress.errors.length,
-      mode: transport.mode,
     };
   } catch (err) {
-    if (err instanceof MiyoUnreachableError) {
-      await patchSiteState(adapter.id, { last_sync_error: 'miyo_unreachable' });
-      return { kind: 'aborted', reason: 'miyo_unreachable' };
-    }
     if (err instanceof FatalError && (err.status === 401 || err.status === 403)) {
       return finalizeAsSignedOut();
     }
+    if (err instanceof DOMException && err.name === 'NotAllowedError') {
+      await patchSiteState(adapter.id, { last_sync_error: 'permission_revoked' });
+      return { kind: 'aborted', reason: 'permission_revoked' };
+    }
     const message = err instanceof Error ? err.message : String(err);
     await patchSiteState(adapter.id, { last_sync_error: message });
-    await transport
-      .postSyncFinish(adapter.id, {
-        written: progress.completed,
-        errors: progress.errors.length,
-        cursor_updated_at: cursorAt,
-        error_summary: message,
-      })
-      .catch(() => {});
+    await writer.writeMeta(meta).catch(() => {});
     return { kind: 'aborted', reason: message };
   }
 }
