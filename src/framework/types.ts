@@ -93,7 +93,7 @@ export type SiteAdapter = ChatSiteAdapter | CustomSiteAdapter;
 export interface SiteState {
   // Highest `updated_at` we have successfully synced (only advances
   // when a sync run finishes; partial runs leave it unchanged).
-  // SyncProgress.pending_ids handles intra-run resumability.
+  // SyncProgress.pending_items handles intra-run resumability.
   //
   // Mirrors sync.cursor_updated_at in .miyo-capture.json. On Chrome
   // the meta file is authoritative; on Firefox/Safari (downloads-only,
@@ -118,7 +118,10 @@ export interface SyncProgress {
   total: number | null;
   completed: number;
   list_cursor: string | null;
-  pending_ids: string[];
+  // Each entry carries the item's own updated_at so the captures map
+  // in .miyo-capture.json records per-item timestamps faithfully,
+  // rather than the page-max running watermark.
+  pending_items: Array<{ id: string; updated_at: string }>;
   errors: Array<{ item_id: string; message: string }>;
   list_exhausted: boolean;
 }

@@ -18,7 +18,7 @@
 //   2. The cursor (last successfully synced `updated_at`) only
 //      advances at the end of a fully-completed run. A partial run
 //      that gets interrupted leaves the cursor unchanged, and the
-//      next click resumes via `SyncProgress.pending_ids`.
+//      next click resumes via `SyncProgress.pending_items`.
 //
 //   3. SyncProgress is persisted after every individual successful
 //      delivery. A service-worker kill at any point loses at most
@@ -80,7 +80,7 @@ function freshProgress(): SyncProgress {
     total: null,
     completed: 0,
     list_cursor: null,
-    pending_ids: [],
+    pending_items: [],
     errors: [],
     list_exhausted: false,
   };
@@ -175,8 +175,8 @@ export async function runSync(
 
   try {
     while (progress.completed < MAX_PER_RUN) {
-      // Refill pending_ids from the next list page when empty.
-      if (progress.pending_ids.length === 0) {
+      // Refill pending_items from the next list page when empty.
+      if (progress.pending_items.length === 0) {
         if (progress.list_exhausted) break;
         const page = await paced(adapter.id, () => adapter.listItems(progress.list_cursor));
         if (progress.total === null && page.total !== null) progress.total = page.total;
@@ -194,26 +194,28 @@ export async function runSync(
           if (!highestSeen || item.updated_at > highestSeen) highestSeen = item.updated_at;
           // Skip items already in the captures map.
           if (hasCapture(meta, item.id)) continue;
-          progress.pending_ids.push(item.id);
+          progress.pending_items.push({ id: item.id, updated_at: item.updated_at });
         }
         progress.list_exhausted = hitCursor || page.next_cursor === null;
         progress.list_cursor = page.next_cursor;
         await setSyncProgress(adapter.id, progress);
 
-        if (progress.pending_ids.length === 0) {
+        if (progress.pending_items.length === 0) {
           if (progress.list_exhausted) break;
           continue;
         }
       }
 
-      const id = progress.pending_ids.shift()!;
+      const pending = progress.pending_items.shift()!;
       try {
-        const rendered = await paced(adapter.id, () => renderForAdapter(adapter, id));
+        const rendered = await paced(adapter.id, () =>
+          renderForAdapter(adapter, pending.id)
+        );
         await writer.write(rendered.filename, rendered.body);
 
-        meta = mergeCapture(meta, id, {
+        meta = mergeCapture(meta, pending.id, {
           filename: rendered.filename,
-          updated_at: highestSeen,
+          updated_at: pending.updated_at,
         });
         progress.completed += 1;
         await setSyncProgress(adapter.id, progress);
@@ -240,7 +242,7 @@ export async function runSync(
           return { kind: 'aborted', reason: 'permission_revoked' };
         }
         const message = err instanceof Error ? err.message : String(err);
-        progress.errors.push({ item_id: id, message });
+        progress.errors.push({ item_id: pending.id, message });
         await setSyncProgress(adapter.id, progress);
       }
     }
