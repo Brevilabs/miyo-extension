@@ -522,11 +522,32 @@ async function onSync(siteId: SiteId): Promise<void> {
 
   const port = chrome.runtime.connect({ name: 'sync' });
   port.postMessage({ type: 'start', site: siteId });
+  wireSyncPort(port, siteId);
+}
+
+// Shared port-message handler used by both fresh syncs (onSync) and
+// re-attach to an in-flight run (init). The protocol is the same in
+// both directions; only the opening message ('start' vs 'attach')
+// differs.
+function wireSyncPort(port: chrome.runtime.Port, siteId: SiteId): void {
   port.onMessage.addListener((msg) => {
     if (msg?.type === 'progress' && msg.site === siteId) {
       ui.syncProgress = { completed: msg.completed, total: msg.total };
       render();
-    } else if (msg?.type === 'done') {
+      return;
+    }
+    if (msg?.type === 'not_running' && msg.site === siteId) {
+      // SW says nothing is in flight — popup's active_sync was stale
+      // (likely from a previous browser session). Clear quietly and
+      // re-render to the idle state.
+      ui.syncing = null;
+      ui.syncProgress = null;
+      port.disconnect();
+      void chrome.storage.local.remove('active_sync');
+      void onRefresh();
+      return;
+    }
+    if (msg?.type === 'done') {
       const done = msg as SyncDone;
       ui.syncing = null;
       ui.syncProgress = null;
@@ -557,6 +578,25 @@ async function onSync(siteId: SiteId): Promise<void> {
       render();
     }
   });
+}
+
+async function getActiveSyncSite(): Promise<SiteId | null> {
+  const obj = await chrome.storage.local.get('active_sync');
+  const entry = obj.active_sync as { site?: string } | undefined;
+  return (entry?.site as SiteId | undefined) ?? null;
+}
+
+// Re-attach the popup to a sync that's already running in the SW. No
+// permission check — the SW is mid-write, so it already has whatever
+// access it needs. The popup's own queryPermission would lie ('prompt')
+// for a freshly-opened document and is the wrong source of truth here.
+function attachToRunningSync(siteId: SiteId): void {
+  ui.syncing = siteId;
+  ui.syncProgress = { completed: 0, total: null };
+
+  const port = chrome.runtime.connect({ name: 'sync' });
+  port.postMessage({ type: 'attach', site: siteId });
+  wireSyncPort(port, siteId);
 }
 
 function explainAbort(reason: string): string {
@@ -616,16 +656,27 @@ async function onReconnect(siteId: SiteId): Promise<void> {
 
 // File System Access permissions can be 'granted' for the popup window
 // but reported differently from the service worker. The popup runs in
-// a real window context, so its hasPermission() answer is the truth.
-// We reconcile each folder site here so the UI reflects what writes
-// will actually be allowed to do.
-async function enrichPermissions(snapshot: PopupSnapshot): Promise<void> {
+// a real window context, so its hasPermission() answer is the truth —
+// EXCEPT when a sync is currently writing in the SW. In that case the
+// SW already has functional access, and the popup's queryPermission
+// returning 'prompt' is a stale view of the new document context,
+// not a real revocation. Surface as "needs_reauth" only when the
+// SW isn't actively using the handle.
+async function enrichPermissions(
+  snapshot: PopupSnapshot,
+  activeSyncSite: SiteId | null
+): Promise<void> {
   await Promise.all(
     snapshot.sites.map(async (site) => {
       if (!site.enabled || site.destination_kind !== 'folder') return;
       const handle = await getFolderHandle(site.id);
       if (!handle) {
         site.destination_missing = true;
+        return;
+      }
+      if (activeSyncSite === site.id) {
+        // SW is mid-sync; trust the writes, not the popup's view.
+        site.destination_needs_reauth = false;
         return;
       }
       // Handle is in IndexedDB but permission may need re-granting
@@ -638,7 +689,8 @@ async function enrichPermissions(snapshot: PopupSnapshot): Promise<void> {
 async function onRefresh(): Promise<void> {
   try {
     ui.snapshot = (await chrome.runtime.sendMessage({ type: 'snapshot' })) as PopupSnapshot;
-    if (ui.snapshot) await enrichPermissions(ui.snapshot);
+    const active = await getActiveSyncSite();
+    if (ui.snapshot) await enrichPermissions(ui.snapshot, active);
   } catch (err) {
     ui.banner = { kind: 'error', text: err instanceof Error ? err.message : String(err) };
   }
@@ -648,13 +700,47 @@ async function onRefresh(): Promise<void> {
 async function init(): Promise<void> {
   render();
   try {
-    ui.snapshot = (await chrome.runtime.sendMessage({ type: 'open' })) as PopupSnapshot;
-    if (ui.snapshot) await enrichPermissions(ui.snapshot);
+    // First paint: cached snapshot only. The 'snapshot' handler in the
+    // SW reads chrome.storage.local without hitting any external API,
+    // so this returns in a handful of ms. 'open'/'probe' would block on
+    // probeAll() — a fresh fetch per enabled site to claude.ai/chatgpt
+    // — which adds 500–2000ms of dead air before the popup renders
+    // anything useful.
+    const [snapshot, active] = await Promise.all([
+      chrome.runtime.sendMessage({ type: 'snapshot' }) as Promise<PopupSnapshot>,
+      getActiveSyncSite(),
+    ]);
+    ui.snapshot = snapshot;
+    if (ui.snapshot) await enrichPermissions(ui.snapshot, active);
+    if (active) attachToRunningSync(active);
   } catch (err) {
     ui.banner = { kind: 'error', text: err instanceof Error ? err.message : String(err) };
   } finally {
     ui.initializing = false;
     render();
+  }
+
+  // Background refresh: kick off the actual probe (network calls to
+  // claude.ai / chatgpt). The cached snapshot we just rendered may show
+  // a session as signed-in when the user has since signed out elsewhere
+  // — that lie self-corrects when this returns. Fire-and-forget; probe
+  // failures are silent because the user can already see / use the
+  // cached state.
+  void refreshSessions();
+}
+
+async function refreshSessions(): Promise<void> {
+  try {
+    const fresh = (await chrome.runtime.sendMessage({
+      type: 'probe',
+    })) as PopupSnapshot;
+    if (!fresh) return;
+    const active = await getActiveSyncSite();
+    await enrichPermissions(fresh, active);
+    ui.snapshot = fresh;
+    render();
+  } catch {
+    // Best-effort; cached state stays on screen.
   }
 }
 

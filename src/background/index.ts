@@ -25,7 +25,83 @@ import { runSync } from '../framework/sync.js';
 import { getSiteState, patchSiteState } from '../framework/state.js';
 import { getSiteConfig, getFolderHandle } from '../framework/destinations.js';
 import { makeWriter } from '../framework/writer.js';
-import type { PopupSnapshot, SiteAdapter, SiteRowSnapshot } from '../framework/types.js';
+import type {
+  PopupSnapshot,
+  SiteAdapter,
+  SiteId,
+  SiteRowSnapshot,
+} from '../framework/types.js';
+
+// ──────────────────────────────────────────────────────────────────
+// Keepalive
+// ──────────────────────────────────────────────────────────────────
+//
+// MV3 service workers are idle-killed after ~30s without chrome.* API
+// events. A long-running sync mostly awaits fetch() and IndexedDB,
+// which reset the timer most of the time but not reliably between
+// fetches. We belt-and-suspender with chrome.alarms: a recurring alarm
+// is a chrome event that wakes the SW even if it had gone idle, and
+// (more importantly) keeps it from being marked idle in the first
+// place. The listener does nothing — the wake-up itself is the point.
+
+const KEEPALIVE_ALARM = 'sync-keepalive';
+
+function startKeepalive(): void {
+  // 30s is the minimum periodInMinutes-supported interval (0.5 min).
+  // Right at the idle threshold, but reliable in practice because the
+  // alarm fires *as* the SW is about to go idle, not after.
+  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
+}
+
+function stopKeepalive(): void {
+  void chrome.alarms.clear(KEEPALIVE_ALARM);
+}
+
+chrome.alarms.onAlarm.addListener(() => {
+  // Wake-up only; the SW running this listener is itself the work.
+});
+
+// ──────────────────────────────────────────────────────────────────
+// In-flight sync tracking
+// ──────────────────────────────────────────────────────────────────
+//
+// One sync run at a time across all sites. Subscribers (popup ports)
+// can attach mid-run; they all see the same progress stream. The
+// active_sync entry in chrome.storage.local mirrors `runningSync.siteId`
+// for the popup to read on init — necessary because a freshly-opened
+// popup gets a new document context and doesn't know what the SW is
+// doing until it asks.
+
+interface RunningSync {
+  siteId: SiteId;
+  subscribers: Set<chrome.runtime.Port>;
+  progress: { completed: number; total: number | null };
+}
+
+let runningSync: RunningSync | null = null;
+
+const ACTIVE_SYNC_KEY = 'active_sync';
+
+async function setActiveSyncState(site: SiteId | null): Promise<void> {
+  if (site === null) {
+    await chrome.storage.local.remove(ACTIVE_SYNC_KEY);
+  } else {
+    await chrome.storage.local.set({
+      [ACTIVE_SYNC_KEY]: { site, started_at: Date.now() },
+    });
+  }
+}
+
+function broadcastToSubscribers(entry: RunningSync, msg: unknown): void {
+  for (const port of entry.subscribers) {
+    try {
+      port.postMessage(msg);
+    } catch {
+      // Subscriber's popup closed; will be cleaned up on its own
+      // onDisconnect. Ignore here.
+    }
+  }
+}
 
 async function buildSiteRow(adapter: SiteAdapter): Promise<SiteRowSnapshot> {
   const [config, state] = await Promise.all([
@@ -133,37 +209,114 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'sync') return;
 
-  let safePost = (msg: unknown): void => {
+  const safePost = (msg: unknown): void => {
     try {
       port.postMessage(msg);
     } catch {
-      // Popup closed — work continues silently to completion.
+      // Port already disconnected; ignored.
     }
   };
+
   port.onDisconnect.addListener(() => {
-    safePost = () => {};
+    if (runningSync) runningSync.subscribers.delete(port);
   });
 
   port.onMessage.addListener((msg) => {
-    if (msg?.type === 'start' && typeof msg.site === 'string') {
-      const adapter = getAdapter(msg.site);
-      if (!adapter) {
+    if (typeof msg !== 'object' || msg === null) return;
+    const m = msg as { type?: string; site?: string };
+
+    // Re-attach from a freshly-opened popup. No new run, no permission
+    // check — the SW already has whatever access it needed for the
+    // in-flight sync.
+    if (m.type === 'attach' && typeof m.site === 'string') {
+      if (runningSync && runningSync.siteId === m.site) {
+        runningSync.subscribers.add(port);
         safePost({
-          type: 'done',
-          site: msg.site,
-          result: { kind: 'aborted', reason: 'unknown_site' },
+          type: 'progress',
+          site: m.site,
+          completed: runningSync.progress.completed,
+          total: runningSync.progress.total,
         });
-        return;
+      } else {
+        // No matching run. The popup will clear its stale active_sync
+        // and re-render to the idle state.
+        safePost({ type: 'not_running', site: m.site });
       }
-      void (async () => {
+      return;
+    }
+
+    if (m.type !== 'start' || typeof m.site !== 'string') return;
+
+    const adapter = getAdapter(m.site);
+    if (!adapter) {
+      safePost({
+        type: 'done',
+        site: m.site,
+        result: { kind: 'aborted', reason: 'unknown_site' },
+      });
+      return;
+    }
+
+    // Dedup: if this site is already syncing, attach instead of starting
+    // a second concurrent run.
+    if (runningSync && runningSync.siteId === adapter.id) {
+      runningSync.subscribers.add(port);
+      safePost({
+        type: 'progress',
+        site: adapter.id,
+        completed: runningSync.progress.completed,
+        total: runningSync.progress.total,
+      });
+      return;
+    }
+
+    // A different site is already syncing — refuse, surface as aborted.
+    if (runningSync) {
+      safePost({
+        type: 'done',
+        site: adapter.id,
+        result: { kind: 'aborted', reason: 'busy' },
+      });
+      return;
+    }
+
+    // Start a fresh run.
+    const entry: RunningSync = {
+      siteId: adapter.id,
+      subscribers: new Set([port]),
+      progress: { completed: 0, total: null },
+    };
+    runningSync = entry;
+    startKeepalive();
+    void setActiveSyncState(adapter.id);
+
+    void (async () => {
+      try {
         const result = await runSync(adapter, {
           onProgress: ({ completed, total }) => {
-            safePost({ type: 'progress', site: adapter.id, completed, total });
+            entry.progress = { completed, total };
+            broadcastToSubscribers(entry, {
+              type: 'progress',
+              site: adapter.id,
+              completed,
+              total,
+            });
           },
         });
-        safePost({ type: 'done', site: adapter.id, result });
-      })();
-    }
+        broadcastToSubscribers(entry, { type: 'done', site: adapter.id, result });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        broadcastToSubscribers(entry, {
+          type: 'done',
+          site: adapter.id,
+          result: { kind: 'aborted', reason: message },
+        });
+      } finally {
+        if (runningSync === entry) runningSync = null;
+        stopKeepalive();
+        await setActiveSyncState(null);
+      }
+    })();
   });
 });
 
