@@ -110,111 +110,149 @@ type ShowDirectoryPicker = (opts?: DirectoryPickerOptions) => Promise<FileSystem
 // Rendering
 // ──────────────────────────────────────────────────────────────────
 
+// Each site gets a small brand accent (left rail + logo tint) — same
+// palette the desktop SourcesTab uses, so the two surfaces feel like one
+// product. Unknown sites fall back to the teal accent.
+const SITE_BRAND: Record<string, { color: string; soft: string; initial: string }> = {
+  chatgpt: { color: '#10a37f', soft: '#e0f5ee', initial: 'C' },
+  claude: { color: '#c66439', soft: '#f8e7dc', initial: 'A' },
+  claude_ai: { color: '#c66439', soft: '#f8e7dc', initial: 'A' },
+};
+
+function brandFor(siteId: string, label: string): { color: string; soft: string; initial: string } {
+  const id = siteId.toLowerCase();
+  return (
+    SITE_BRAND[id] ?? {
+      color: '#0f766e',
+      soft: '#d9f1ef',
+      initial: label.charAt(0).toUpperCase() || '·',
+    }
+  );
+}
+
+function siteStatus(s: SiteRowSnapshot, isSyncing: boolean): { cls: string; text: string } {
+  if (isSyncing) return { cls: 'status-syncing', text: 'Syncing' };
+  if (!s.enabled) return { cls: 'status-off', text: 'Off' };
+  if (s.destination_missing) return { cls: 'status-warn', text: 'Reconnect' };
+  if (s.destination_needs_reauth) return { cls: 'status-warn', text: 'Access' };
+  if (s.paused) return { cls: 'status-paused', text: 'Paused' };
+  if (s.last_sync_error && s.last_sync_error !== 'permission_revoked')
+    return { cls: 'status-error', text: 'Error' };
+  return { cls: 'status-ready', text: 'Ready' };
+}
+
 function renderSiteRow(s: SiteRowSnapshot): string {
   const isSyncing = ui.syncing === s.id;
   const anyBusy = ui.syncing !== null;
+  const brand = brandFor(s.id, s.label);
+  const status = siteStatus(s, isSyncing);
+  const cardStyle = `--svc-color:${brand.color};--svc-color-soft:${brand.soft};`;
 
   if (!s.enabled) {
     return `
-      <div class="site-row">
-        <div class="header">
-          <span class="label">${escape(s.label)}</span>
-          <button class="small" data-action="enable" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Enable →</button>
+      <div class="site-card" style="${cardStyle}">
+        <div class="site-card-head">
+          <div class="site-logo">${escape(brand.initial)}</div>
+          <div class="site-title">
+            <div class="site-name">${escape(s.label)}</div>
+            <div class="site-blurb">Save your ${escape(s.label)} conversations as local markdown.</div>
+          </div>
+          <button class="primary-button" data-action="enable" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Enable →</button>
         </div>
-        <div class="meta muted">Save your ${escape(s.label)} conversations as markdown.</div>
       </div>`;
   }
 
-  // Enabled
-  const statusDot = s.paused
-    ? '⏸'
-    : s.destination_missing
-      ? '⚠'
-      : s.destination_needs_reauth
-        ? '○'
-        : '●';
-  const dest = s.destination_missing
-    ? '<span class="error">folder no longer available</span>'
-    : s.destination_label
-      ? `<span class="muted">→ ${escape(s.destination_label)}</span>`
-      : '<span class="muted">→ no destination</span>';
+  // ── Enabled ─────────────────────────────────────────────────────
+  const accountLine = s.session?.signedIn
+    ? s.session.email
+      ? `<span class="site-account">${escape(s.session.email)}</span>`
+      : `<span class="site-account">signed in</span>`
+    : s.session
+      ? `<span class="site-account">not signed in</span>`
+      : '';
 
-  const meta: string[] = [];
-  if (s.session?.signedIn) {
-    meta.push(
-      `<div class="meta">${s.session.email ? `Signed in as ${escape(s.session.email)}` : 'Signed in'}</div>`
-    );
-  } else if (s.session) {
-    meta.push(
-      `<div class="meta muted">Not signed in. Open ${escape(s.label)} in a tab and sign in.</div>`
-    );
-  }
+  const destLine = s.destination_missing
+    ? `<div class="site-warn">Folder no longer available — reconnect to resume.</div>`
+    : s.destination_label
+      ? `<div class="site-meta-dest"><span class="site-meta-arrow">→</span><span class="site-path">${escape(s.destination_label)}</span></div>`
+      : `<div class="site-meta-dest"><span class="site-meta-arrow">→</span><span class="site-path">no destination</span></div>`;
 
   const countPart =
     s.captures_count !== null
-      ? `${s.captures_count} capture${s.captures_count === 1 ? '' : 's'}`
+      ? `<strong>${s.captures_count}</strong> capture${s.captures_count === 1 ? '' : 's'}`
       : null;
-  const lastSyncPart = `last sync ${fmtTime(s.last_sync_at)}`;
-  const detail = countPart ? `${countPart} · ${lastSyncPart}` : lastSyncPart;
-  meta.push(`<div class="meta">${detail}</div>`);
+  const whenPart = `<span class="site-when">last sync ${escape(fmtTime(s.last_sync_at))}</span>`;
+  const countsLine = `<div class="site-counts">${countPart ? `${countPart} · ${whenPart}` : whenPart}</div>`;
 
+  let noteLine = '';
   if (s.destination_needs_reauth) {
-    meta.push(
-      `<div class="meta muted">Needs folder access for this session — click Sync to grant.</div>`
-    );
+    noteLine = `<div class="site-warn">Needs folder access — click Sync to grant.</div>`;
+  } else if (s.session && !s.session.signedIn) {
+    noteLine = `<div class="site-warn">Open ${escape(s.label)} in a tab and sign in.</div>`;
   } else if (s.last_sync_error && s.last_sync_error !== 'permission_revoked') {
-    meta.push(
-      `<div class="err"><span class="error">${escape(explainAbort(s.last_sync_error))}</span></div>`
-    );
+    noteLine = `<div class="site-err">${escape(explainAbort(s.last_sync_error))}</div>`;
   }
 
   let progress = '';
-  if (isSyncing && ui.syncProgress) {
-    const { completed, total } = ui.syncProgress;
-    progress = total
-      ? `<div class="progress">Syncing ${completed} of ${total}…</div>`
-      : `<div class="progress">Syncing ${completed}…</div>`;
+  if (isSyncing) {
+    const text = ui.syncProgress
+      ? ui.syncProgress.total
+        ? `${ui.syncProgress.completed} of ${ui.syncProgress.total}`
+        : `${ui.syncProgress.completed} captured`
+      : 'Starting…';
+    const bar =
+      ui.syncProgress && ui.syncProgress.total
+        ? `<div class="progress-bar-container"><div class="progress-bar" style="width:${Math.min(100, Math.round((ui.syncProgress.completed / ui.syncProgress.total) * 100))}%"></div></div>`
+        : `<div class="progress-bar-container"><div class="progress-bar progress-bar-indeterminate"></div></div>`;
+    progress = `<div class="site-progress">${bar}<span class="site-progress-text">${escape(text)}</span></div>`;
   }
 
   // Actions row
   const actions: string[] = [];
   if (s.destination_missing) {
     actions.push(
-      `<button class="primary small" data-action="reconnect" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Reconnect</button>`
+      `<button class="primary-button" data-action="reconnect" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Reconnect</button>`
     );
   } else if (s.paused) {
     actions.push(
-      `<button class="primary small" data-action="resume" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Resume</button>`
+      `<button class="primary-button" data-action="resume" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Resume</button>`
     );
   } else {
     const syncDisabled = anyBusy && !isSyncing;
     actions.push(
-      `<button class="primary small" data-action="sync" data-site="${escape(s.id)}" ${syncDisabled ? 'disabled' : ''}>${isSyncing ? 'Syncing…' : 'Sync now'}</button>`
+      `<button class="primary-button" data-action="sync" data-site="${escape(s.id)}" ${syncDisabled ? 'disabled' : ''}>${isSyncing ? 'Syncing…' : 'Sync now'}</button>`
     );
     if (!isSyncing) {
       actions.push(
-        `<button class="link" data-action="pause" data-site="${escape(s.id)}">Pause</button>`
+        `<button class="link-button" data-action="pause" data-site="${escape(s.id)}">Pause</button>`
       );
     }
   }
   if (!isSyncing) {
     actions.push(
-      `<button class="link" data-action="change-destination" data-site="${escape(s.id)}">Change folder</button>`
+      `<button class="link-button" data-action="change-destination" data-site="${escape(s.id)}">Change folder</button>`
     );
     actions.push(
-      `<button class="link" data-action="disable" data-site="${escape(s.id)}">Disable</button>`
+      `<button class="link-button link-button-danger" data-action="disable" data-site="${escape(s.id)}">Disable</button>`
     );
   }
 
   return `
-    <div class="site-row">
-      <div class="header">
-        <span class="label">${statusDot} ${escape(s.label)}${s.paused ? ' (paused)' : ''}</span>
-        ${dest}
+    <div class="site-card" style="${cardStyle}">
+      <div class="site-card-head">
+        <div class="site-logo">${escape(brand.initial)}</div>
+        <div class="site-title">
+          <div class="site-name">${escape(s.label)}${accountLine}</div>
+        </div>
+        <span class="status-pill site-status ${status.cls}">${escape(status.text)}</span>
       </div>
-      ${meta.join('')}
+      <div class="site-meta">
+        ${destLine}
+        ${countsLine}
+        ${noteLine}
+      </div>
       ${progress}
-      <div class="actions">${actions.join('')}</div>
+      <div class="site-actions">${actions.join('')}</div>
     </div>`;
 }
 
@@ -228,50 +266,104 @@ function renderEnableModal(): string {
 
   const body = canPickFolder
     ? `
-        <p class="muted">Pick a folder on your computer. Your ${escape(label)} captures will be saved there as one markdown file per conversation.</p>
-        <div class="actions">
-          <button class="primary" data-action="modal-pick-folder">Choose folder</button>
-          <button class="link" data-action="modal-cancel">Cancel</button>
+        <p class="modal-body">Pick a folder on your computer. Your ${escape(label)} captures will be saved there as one markdown file per conversation.</p>
+        <div class="modal-actions">
+          <button class="link-button" data-action="modal-cancel">Cancel</button>
+          <button class="primary-button" data-action="modal-pick-folder">Choose folder</button>
         </div>`
     : `
-        <p class="muted">Your browser doesn't support folder selection. ${escape(label)} captures will be saved to your Downloads folder:</p>
-        <p><code>~/Downloads/${escape(defaultDownloadsSubpath(label))}</code></p>
-        <div class="actions">
-          <button class="primary" data-action="modal-use-downloads">Save to Downloads</button>
-          <button class="link" data-action="modal-cancel">Cancel</button>
+        <p class="modal-body">Your browser doesn't support folder selection. ${escape(label)} captures will be saved to your Downloads folder:</p>
+        <p class="modal-code">~/Downloads/${escape(defaultDownloadsSubpath(label))}</p>
+        <div class="modal-actions">
+          <button class="link-button" data-action="modal-cancel">Cancel</button>
+          <button class="primary-button" data-action="modal-use-downloads">Save to Downloads</button>
         </div>`;
 
   return `
-    <div class="modal-backdrop">
-      <div class="modal">
-        <h1>Enable ${escape(label)} capture</h1>
-        ${error ? `<p class="error">${escape(error)}</p>` : ''}
+    <div class="modal-overlay">
+      <div class="modal-card">
+        <h1 class="modal-title">Enable ${escape(label)} capture</h1>
+        ${error ? `<p class="modal-error">${escape(error)}</p>` : ''}
         ${body}
       </div>
     </div>`;
 }
 
+// Sum captures across sites that report a count. Sites on a Downloads
+// destination return null (we can't enumerate the folder), so we treat
+// them as "unknown" and skip them — better than lying with a low total.
+function totalCaptures(snapshot: PopupSnapshot | null): number | null {
+  if (!snapshot) return null;
+  let total = 0;
+  let anyKnown = false;
+  for (const s of snapshot.sites) {
+    if (s.captures_count !== null) {
+      total += s.captures_count;
+      anyKnown = true;
+    }
+  }
+  return anyKnown ? total : null;
+}
+
+function renderHeader(): string {
+  const total = totalCaptures(ui.snapshot);
+  const stat =
+    total !== null
+      ? `<div class="pop-stat">
+           <span class="pop-stat-num">${total.toLocaleString()}</span>
+           <span class="pop-stat-label">${total === 1 ? 'capture' : 'captures'}</span>
+         </div>`
+      : '';
+  return `
+    <div class="pop-head">
+      <div>
+        <span class="pop-wordmark">miyo</span><span class="pop-wordmark-sub">capture</span>
+      </div>
+      ${stat}
+    </div>
+    <p class="pop-tagline">Save your AI conversations as local markdown.</p>
+  `;
+}
+
+function renderFooter(): string {
+  return `
+    <div class="pop-foot">
+      <span class="pop-foot-tag">yours, on your machine</span>
+      <span class="pop-ver">v${escape(chrome.runtime.getManifest().version)}</span>
+    </div>
+  `;
+}
+
 function render(): void {
   if (ui.initializing) {
-    root.innerHTML = `<h1>Miyo Capture</h1><p class="muted">Loading…</p>`;
+    root.innerHTML = `
+      ${renderHeader()}
+      <div class="pop-loading">loading…</div>
+    `;
     return;
   }
   const sites = ui.snapshot?.sites ?? [];
   const noneEnabled = sites.every((s) => !s.enabled);
 
   root.innerHTML = `
-    <h1>Miyo Capture</h1>
+    ${renderHeader()}
     ${
       ui.banner
-        ? `<div class="banner"><span class="${ui.banner.kind === 'error' ? 'error' : 'muted'}">${escape(ui.banner.text)}</span></div>`
+        ? `<div class="pop-banner ${ui.banner.kind === 'error' ? 'pop-banner-error' : 'pop-banner-info'}">${escape(ui.banner.text)}</div>`
         : ''
     }
     ${
-      noneEnabled
-        ? `<p class="muted">Capture your AI chats as local markdown. Pick a site to start.</p>`
+      noneEnabled && sites.length > 0
+        ? `<div class="pop-empty">
+            <h2 class="pop-empty-title">Pick a site to start</h2>
+            <p class="pop-empty-desc">Captures stay on your machine, in a folder you choose.</p>
+           </div>`
         : ''
     }
-    ${sites.map(renderSiteRow).join('')}
+    <div class="site-list">
+      ${sites.map(renderSiteRow).join('')}
+    </div>
+    ${renderFooter()}
     ${renderEnableModal()}
   `;
 

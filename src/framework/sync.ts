@@ -162,6 +162,16 @@ export async function runSync(
 
   const progress = (await getSyncProgress(adapter.id)) ?? freshProgress();
 
+  // Resume after a cap_reached pause: prior run filled MAX_PER_RUN
+  // items and stopped. The pending_items queue and list_cursor carry
+  // forward so we can resume mid-stream, but `completed` is the
+  // per-click counter — reset it so this click can capture another
+  // batch instead of bailing out immediately at the cap check.
+  if (progress.completed >= MAX_PER_RUN) {
+    progress.completed = 0;
+    progress.errors = [];
+  }
+
   const finalizeAsSignedOut = async (): Promise<SyncResult> => {
     await patchSiteState(adapter.id, {
       last_sync_error: 'signed_out',

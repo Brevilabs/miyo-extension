@@ -34,6 +34,7 @@ async function copyStatic() {
   await cp(resolve(ROOT, 'public'), DIST, { recursive: true });
   await cp(resolve(ROOT, 'src/popup/popup.html'), resolve(DIST, 'popup.html'));
   await cp(resolve(ROOT, 'src/popup/popup.css'), resolve(DIST, 'popup.css'));
+  await cp(resolve(ROOT, 'src/popup/fonts'), resolve(DIST, 'fonts'), { recursive: true });
 }
 
 async function build() {

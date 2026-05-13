@@ -42,7 +42,12 @@ interface ClaudeAccountInfo {
 }
 
 const ORG_CACHE_KEY = 'org:claude';
-const PAGE_SIZE = 50;
+// Claude's /chat_conversations endpoint historically returned the full
+// list. As of 2026 it paginates server-side, defaulting to a small page
+// (~6–30 most-recent) when called without query params. We pass an
+// explicit ?limit and ?offset so we control the page size; 200 is a
+// round-trip-friendly balance for users with hundreds of chats.
+const PAGE_SIZE = 200;
 
 async function claudeApi<T>(urlPath: string): Promise<T> {
   const res = await fetch(`https://claude.ai${urlPath}`, {
@@ -77,6 +82,40 @@ async function discoverOrgId(): Promise<string> {
   if (!first) throw new Error('No Claude organizations returned for this account');
   await setCachedOrgId(first.uuid);
   return first.uuid;
+}
+
+// The /chat_conversations endpoint is unstable across Claude releases —
+// sometimes a bare array, sometimes wrapped in { conversations: [...] }
+// or { data: [...] } with optional paging metadata. We accept any of
+// these so a future shape tweak from Anthropic doesn't silently truncate
+// the user's library to 0 again.
+function extractList(raw: unknown): ClaudeListItem[] {
+  if (Array.isArray(raw)) return raw as ClaudeListItem[];
+  if (raw && typeof raw === 'object') {
+    const obj = raw as Record<string, unknown>;
+    for (const key of ['conversations', 'data', 'items', 'results']) {
+      const v = obj[key];
+      if (Array.isArray(v)) return v as ClaudeListItem[];
+    }
+  }
+  return [];
+}
+
+function extractTotal(raw: unknown): number | null {
+  // For a bare-array response we can't tell whether this is the whole
+  // library or one paginated page — returning the array length here
+  // would mislead the progress bar (e.g. "12 of 200" when the real
+  // total is 1,000). Leave it null and let the framework show an
+  // indeterminate count instead.
+  if (Array.isArray(raw)) return null;
+  if (raw && typeof raw === 'object') {
+    const obj = raw as Record<string, unknown>;
+    for (const key of ['total', 'total_count', 'count']) {
+      const v = obj[key];
+      if (typeof v === 'number') return v;
+    }
+  }
+  return null;
 }
 
 function messageText(m: ClaudeFullConversation['chat_messages'][number]): string {
@@ -125,18 +164,47 @@ export const claudeAdapter: ChatSiteAdapter = {
   async listItems(cursor: string | null): Promise<ItemListPage> {
     const orgId = await discoverOrgId();
     const offset = cursor ? Number.parseInt(cursor, 10) : 0;
-    // Claude's /chat_conversations endpoint returns the full list with
-    // no server-side pagination — sort and slice locally. The list
-    // payload is ~100B per row even for thousands of conversations.
-    const list = await claudeApi<ClaudeListItem[]>(
-      `/api/organizations/${orgId}/chat_conversations`
+    // Pass ?limit and ?offset explicitly. The endpoint behaves one of
+    // two ways and we detect which from the response — don't trust the
+    // server to respect our params:
+    //   • Modern: respects ?limit, returns ≤ PAGE_SIZE rows for this
+    //     offset. We advance the offset by what we got.
+    //   • Legacy: ignores params, returns the entire library every call.
+    //     We slice client-side so each page progresses and termination
+    //     is correct (otherwise next_cursor never resolves to null).
+    const raw = await claudeApi<unknown>(
+      `/api/organizations/${orgId}/chat_conversations?limit=${PAGE_SIZE}&offset=${offset}`
     );
-    const sorted = list.slice().sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
-    const slice = sorted.slice(offset, offset + PAGE_SIZE);
-    const items = slice.map((it) => ({ id: it.uuid, updated_at: it.updated_at }));
-    const next_offset = offset + PAGE_SIZE;
-    const next_cursor = next_offset >= sorted.length ? null : String(next_offset);
-    return { items, next_cursor, total: sorted.length };
+    const fullList = extractList(raw);
+    const serverPaginated = fullList.length <= PAGE_SIZE;
+
+    let pageRows: ClaudeListItem[];
+    let next_cursor: string | null;
+    let total: number | null;
+
+    if (serverPaginated) {
+      pageRows = fullList;
+      next_cursor = fullList.length < PAGE_SIZE ? null : String(offset + fullList.length);
+      total = extractTotal(raw);
+    } else {
+      // Legacy: server gave us the whole library. Sort once, slice the
+      // page we need, and use the full-list length as the authoritative
+      // total. next_cursor is null once we've sliced past the end.
+      const sortedAll = fullList
+        .slice()
+        .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+      pageRows = sortedAll.slice(offset, offset + PAGE_SIZE);
+      const nextOffset = offset + PAGE_SIZE;
+      next_cursor = nextOffset >= sortedAll.length ? null : String(nextOffset);
+      total = sortedAll.length;
+    }
+
+    // Page-local newest-first sort. Redundant for the legacy branch
+    // (already sorted) but cheap, and required for the modern branch
+    // since the server's per-page order isn't guaranteed.
+    const sorted = pageRows.slice().sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
+    const items = sorted.map((it) => ({ id: it.uuid, updated_at: it.updated_at }));
+    return { items, next_cursor, total };
   },
 
   async fetchConversation(id: string): Promise<ChatConversation> {
