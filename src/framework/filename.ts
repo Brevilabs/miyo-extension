@@ -5,7 +5,6 @@
 // same filename so re-fetches overwrite the existing file (idempotent
 // writes) and title-change detection (rename old → new) works.
 
-// eslint-disable-next-line no-control-regex
 const FILENAME_UNSAFE = /[/\\:*?"<>|\x00-\x1f]/g;
 const TITLE_MAX = 80;
 

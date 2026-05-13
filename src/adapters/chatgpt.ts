@@ -179,7 +179,6 @@ function flatten(full: ChatgptFullConversation): ChatMessage[] {
 export const chatgptAdapter: ChatSiteAdapter = {
   id: 'chatgpt',
   label: 'ChatGPT',
-  subdir: 'chatgpt',
   home_url: 'https://chatgpt.com',
   brand_color: '#10a37f',
   kind: 'chat',

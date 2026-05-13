@@ -44,6 +44,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
-            "miyo-sync-${GITHUB_REF_NAME#v}-chrome.zip" \
+            "miyo-capture-${GITHUB_REF_NAME#v}-chrome.zip" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes

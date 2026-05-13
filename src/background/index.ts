@@ -1,56 +1,102 @@
 // Service worker entry.
 //
 // Responsibilities:
-//   1. Snapshot building for the popup (transport availability +
-//      per-site session + buffer counts).
-//   2. Session probing — runs each adapter's probeSession on
+//   1. Snapshot building for the popup. Composes per-site config
+//      (enabled / paused / destination), state (session, last sync),
+//      and folder-derived info (capture count read from the
+//      .miyo-capture.json in the destination folder, when available).
+//   2. Session probing — runs each enabled adapter's probeSession on
 //      startup, install, and on popup-driven refresh.
 //   3. The sync orchestrator's host. The popup opens a port named
 //      'sync' and tells us which site to sync; we run runSync and
 //      pipe progress back over the port.
-//   4. The buffer→Miyo replay host. Same port, different message
-//      type. Replay only runs when Miyo is reachable; the popup
-//      gates the button on that state.
 //
 // We deliberately do NOT auto-sync. The only trigger is a user
 // clicking Sync now in the popup. There are no alarms, no cookie
 // listeners that fan out to fetches, no timers.
+//
+// Per-site config writes (enable / disable / pause / resume / set
+// destination) are handled directly by the popup writing to
+// chrome.storage.local and IndexedDB. They do not require the
+// background to mediate.
 
 import { ADAPTERS, getAdapter } from '../adapters/index.js';
 import { runSync } from '../framework/sync.js';
-import { runBufferReplay } from '../framework/replay.js';
 import { getSiteState, patchSiteState } from '../framework/state.js';
-import { getAllSources } from '../framework/buffer.js';
-import { snapshotTransports } from '../framework/transports/index.js';
-import type { PopupSnapshot, SiteId } from '../framework/types.js';
+import { getSiteConfig, getFolderHandle } from '../framework/destinations.js';
+import { makeWriter } from '../framework/writer.js';
+import type { PopupSnapshot, SiteAdapter, SiteRowSnapshot } from '../framework/types.js';
+
+async function buildSiteRow(adapter: SiteAdapter): Promise<SiteRowSnapshot> {
+  const [config, state] = await Promise.all([
+    getSiteConfig(adapter.id),
+    getSiteState(adapter.id),
+  ]);
+
+  let destinationLabel: string | null = null;
+  let destinationMissing = false;
+  let capturesCount: number | null = null;
+
+  if (config.destination?.kind === 'downloads') {
+    destinationLabel = `~/Downloads/${config.destination.subpath}`;
+  } else if (config.destination?.kind === 'folder') {
+    const handle = await getFolderHandle(adapter.id);
+    if (!handle) {
+      destinationMissing = true;
+      destinationLabel = '(folder no longer available)';
+    } else {
+      destinationLabel = handle.name;
+      // Best-effort read of meta to surface the capture count. Failures
+      // here (including permission issues) just leave the count null —
+      // we don't try to diagnose permission state from the SW since
+      // queryPermission cross-context is unreliable. The popup does
+      // the real permission check in its window context.
+      try {
+        const wr = await makeWriter(adapter.id, config);
+        if (wr.ok) {
+          const meta = await wr.writer.readMeta();
+          if (meta) capturesCount = Object.keys(meta.captures).length;
+        }
+      } catch {
+        // Ignored; popup will reconcile.
+      }
+    }
+  }
+
+  return {
+    id: adapter.id,
+    label: adapter.label,
+    home_url: adapter.home_url,
+    enabled: config.enabled,
+    paused: config.paused,
+    destination_kind: config.destination?.kind ?? null,
+    destination_label: destinationLabel,
+    destination_missing: destinationMissing,
+    // destination_needs_reauth is filled in by the popup — the SW
+    // cannot reliably read FS Access permission state cross-context.
+    destination_needs_reauth: false,
+    captures_count: capturesCount,
+    session: state.last_session,
+    last_sync_at: state.last_sync_at,
+    last_sync_error: state.last_sync_error,
+  };
+}
 
 async function buildSnapshot(): Promise<PopupSnapshot> {
-  const [transports, bufferedSources] = await Promise.all([
-    snapshotTransports(),
-    getAllSources(),
-  ]);
-  const buffersById = new Map(bufferedSources.map((s) => [s.source_id, s]));
-  const sites = await Promise.all(
-    ADAPTERS.map(async (a) => {
-      const s = await getSiteState(a.id);
-      const buf = buffersById.get(a.id);
-      return {
-        id: a.id,
-        label: a.label,
-        session: s.last_session,
-        last_sync_at: s.last_sync_at,
-        last_sync_error: s.last_sync_error,
-        buffered_count: buf?.item_count ?? 0,
-        last_exported_at: buf?.last_exported_at ?? null,
-      };
-    })
-  );
-  return { transports, sites, active_sync: null };
+  const sites = await Promise.all(ADAPTERS.map(buildSiteRow));
+  return {
+    sites,
+    active_sync: null,
+  };
 }
 
 async function probeAll(): Promise<void> {
+  // Only probe enabled sites — no need to hit network for sites the
+  // user hasn't opted into.
   await Promise.all(
     ADAPTERS.map(async (a) => {
+      const config = await getSiteConfig(a.id);
+      if (!config.enabled) return;
       try {
         const session = await a.probeSession();
         await patchSiteState(a.id, { last_session: session, last_probe_at: Date.now() });
@@ -111,26 +157,12 @@ chrome.runtime.onConnect.addListener((port) => {
       }
       void (async () => {
         const result = await runSync(adapter, {
-          onProgress: ({ completed, total, mode }) => {
-            safePost({ type: 'progress', site: adapter.id, completed, total, mode });
+          onProgress: ({ completed, total }) => {
+            safePost({ type: 'progress', site: adapter.id, completed, total });
           },
         });
         safePost({ type: 'done', site: adapter.id, result });
       })();
-      return;
-    }
-
-    if (msg?.type === 'replay' && typeof msg.site === 'string') {
-      const site = msg.site as SiteId;
-      void (async () => {
-        const result = await runBufferReplay(site, {
-          onProgress: ({ completed, total }) => {
-            safePost({ type: 'replay-progress', site, completed, total });
-          },
-        });
-        safePost({ type: 'replay-done', site, result });
-      })();
-      return;
     }
   });
 });
