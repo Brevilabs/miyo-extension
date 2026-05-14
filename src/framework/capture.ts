@@ -102,6 +102,17 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+function formatDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const sameYear = d.getUTCFullYear() === new Date().getUTCFullYear();
+  return d.toLocaleDateString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    ...(sameYear ? {} : { year: 'numeric' }),
+  });
+}
+
 export async function captureToStore(
   adapter: SiteAdapter,
   store: Store,
@@ -123,6 +134,14 @@ export async function captureToStore(
   // walks page after page. Important on unbounded ("all") syncs
   // where most pages may have nothing new.
   let scanned = 0;
+  // The oldest updated_at the loop has reached so far. Surfaced to
+  // the popup as "back to <date>" so the user can see the depth of
+  // the walk — especially useful on long unbounded syncs.
+  let oldestSeen: string | null = null;
+  // The most recent title we successfully captured. Surfaced as a
+  // detail line so the user sees what's being saved, not just a
+  // count.
+  let lastCapturedTitle: string | null = null;
 
   const flush = async (): Promise<void> => {
     if (unflushed === 0) return;
@@ -186,6 +205,10 @@ export async function captureToStore(
     // On the first page with new items, switch to "Found N new,
     // fetching…" so the user knows fetching is about to start.
     scanned += inRange.length;
+    if (inRange.length > 0) {
+      const pageOldest = inRange[inRange.length - 1]!.updated_at;
+      if (oldestSeen === null || pageOldest < oldestSeen) oldestSeen = pageOldest;
+    }
     if (!firstPageProcessed && missing.length > 0) {
       callbacks.onProgress({
         phase: 'listing',
@@ -195,11 +218,12 @@ export async function captureToStore(
       });
     } else {
       const target = mode === 'miyo' ? 'Miyo' : 'your local cache';
+      const depth = oldestSeen ? ` · back to ${formatDate(oldestSeen)}` : '';
       callbacks.onProgress({
         phase: 'listing',
         completed: 0,
         total: null,
-        note: `Checked ${scanned.toLocaleString()} conversations against ${target}…`,
+        note: `Checked ${scanned.toLocaleString()} against ${target}${depth}…`,
       });
     }
     firstPageProcessed = true;
@@ -212,6 +236,7 @@ export async function captureToStore(
         const captured = await paced(adapter.id, () => renderForAdapter(adapter, item));
         await store.put(captured);
         written += 1;
+        lastCapturedTitle = captured.title;
       } catch (err) {
         if (isSignedOutError(err)) {
           await flush();
@@ -225,7 +250,14 @@ export async function captureToStore(
       }
       unflushed += 1;
       if (unflushed >= RUN_FLUSH_EVERY) await flush();
-      callbacks.onProgress({ phase: 'fetching', completed: written, total: null });
+      callbacks.onProgress({
+        phase: 'fetching',
+        completed: written,
+        total: null,
+        note: lastCapturedTitle
+          ? `${written} captured · ${lastCapturedTitle}`
+          : undefined,
+      });
     }
 
     listCursor = page.next_cursor;

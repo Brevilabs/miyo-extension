@@ -409,14 +409,16 @@ main {
 .site-progress {
   margin-top: 8px;
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .site-progress-text {
   font-size: 11.5px;
   color: var(--teal-strong);
   font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -425,7 +427,7 @@ main {
   background: var(--border-soft);
   border-radius: 3px;
   overflow: hidden;
-  flex: 1;
+  width: 100%;
 }
 
 .progress-bar {
