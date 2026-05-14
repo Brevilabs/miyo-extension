@@ -130,6 +130,89 @@ main {
   border: 1px solid rgba(15, 118, 110, 0.25);
 }
 
+.miyo-checking {
+  color: var(--muted);
+  background: var(--cream);
+  border-color: var(--border);
+  animation: miyo-checking-pulse 1.2s ease-in-out infinite;
+}
+
+/* Switch-style toggle that replaces the "Miyo connected" chip when
+   Miyo is reachable. Reflects the user's miyoEnabled preference. */
+.miyo-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  font-family: 'Fraunces', serif;
+  font-style: italic;
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0;
+}
+
+.miyo-toggle:hover .miyo-toggle-track {
+  border-color: rgba(15, 118, 110, 0.45);
+}
+
+.miyo-toggle-track {
+  position: relative;
+  display: inline-block;
+  width: 26px;
+  height: 14px;
+  border-radius: 999px;
+  background: var(--cream);
+  border: 1px solid var(--border);
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.miyo-toggle-track.on {
+  background: var(--teal-soft);
+  border-color: rgba(15, 118, 110, 0.45);
+}
+
+.miyo-toggle-thumb {
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition:
+    transform 0.15s ease,
+    background 0.15s ease;
+}
+
+.miyo-toggle-track.on .miyo-toggle-thumb {
+  background: var(--teal-strong);
+  transform: translateX(12px);
+}
+
+.miyo-toggle-label {
+  color: var(--ink-soft);
+  font-style: italic;
+}
+
+.miyo-toggle-track.on ~ .miyo-toggle-label,
+.miyo-toggle:hover .miyo-toggle-label {
+  color: var(--teal-strong);
+}
+
+@keyframes miyo-checking-pulse {
+  0%, 100% {
+    opacity: 0.65;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 .pop-stat-num {
   font-family: 'Fraunces', serif;
   font-size: 22px;
@@ -353,6 +436,20 @@ main {
   color: var(--muted);
 }
 
+.site-folder-path {
+  margin-top: 3px;
+  font-family: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, monospace;
+  font-size: 10.5px;
+  color: var(--ink-soft);
+  background: var(--cream);
+  padding: 1px 6px;
+  border-radius: 5px;
+  border: 1px solid var(--border-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .site-counts strong {
   color: var(--ink-soft);
   font-weight: 600;
@@ -539,6 +636,15 @@ main {
   color: var(--ok);
   font-weight: 500;
   letter-spacing: 0;
+}
+
+/* In-flight indicator for the per-site delta probe. Reuses the
+   header-chip pulse animation so both checking states feel related. */
+.checking-badge {
+  font-size: 11px;
+  color: var(--muted);
+  font-style: italic;
+  animation: miyo-checking-pulse 1.2s ease-in-out infinite;
 }
 
 /* ---------- Status pills ---------- */

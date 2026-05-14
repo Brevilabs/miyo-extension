@@ -1,30 +1,15 @@
 // Miyo HTTP client.
 //
-// Implements the app-folder + metadata protocol specified in
-// docs/MIYO_INTERFACE.md.
+// Wire protocol is in docs/MIYO_INTERFACE.md. Miyo desktop binds at
+// 127.0.0.1:8742. The extension probes /v0/health on every popup
+// open with a 1.5s timeout — any failure falls back to local zip mode
+// silently.
 //
-// Miyo desktop binds an HTTP server to 127.0.0.1:8742. The extension
-// probes /v0/health on every popup open. If Miyo answers with
-// service:"running", the popup renders the "Send to Miyo" UI; any
-// failure (refused, slow, non-JSON, service !== "running") falls back
-// to zip mode silently.
-//
-// Endpoint summary:
-//   GET  /v0/health                         — detection
-//   POST /v0/app-folder                     — create-or-get
-//   GET  /v0/app-folder/:app_id/metadata    — read blob
-//   PUT  /v0/app-folder/:app_id/metadata    — write blob
-//   POST /v0/file                           — write a .md
-//
-// `app_id` is the source application — "chatgpt", "claude_ai", etc.
-// The first three endpoints are new ones Miyo must implement; the
-// last two reuse Miyo's existing surface.
+// The extension treats Miyo as a content-addressed store. Per-item
+// existence checks go through items/missing (bulk). There is no
+// metadata blob: Miyo owns the (app_id, item_id) → filename index.
 
-import type {
-  AppFolderMetadata,
-  CapturedItem,
-  SiteId,
-} from './types.js';
+import type { CapturedItem, SiteId } from './types.js';
 
 const MIYO_BASE = 'http://127.0.0.1:8742';
 const HEALTH_TIMEOUT_MS = 1500;
@@ -43,12 +28,11 @@ interface HealthResponse {
 }
 
 export interface AppFolderInfo {
-  folder_name: string;
-  folder_path: string;
   app_id: string;
   label: string;
-  metadata: AppFolderMetadata | null;
-  metadata_updated_at: number | null;
+  folder_name: string;
+  folder_path: string;
+  count: number;
 }
 
 export class MiyoClient {
@@ -59,9 +43,6 @@ export class MiyoClient {
     this.miyoStatus = status;
   }
 
-  // Probe + handshake. Resolves with a ready client; rejects with
-  // MiyoUnavailableError if Miyo isn't running or doesn't answer
-  // /v0/health correctly within HEALTH_TIMEOUT_MS.
   static async connect(): Promise<MiyoClient> {
     let res: Response;
     try {
@@ -78,9 +59,8 @@ export class MiyoClient {
     } catch (err) {
       throw new MiyoUnavailableError(`health body not JSON: ${err}`);
     }
-    // service:"running" is the right signal — status may be "degraded"
-    // when search/embedding aren't ready, but capture writes still
-    // work (we only need /v0/file, /v0/app-folder, /v0/folder).
+    // status may be "degraded" (search/embeddings still warming)
+    // but capture writes only need service:"running".
     if (body.service !== 'running') {
       throw new MiyoUnavailableError(`service is "${body.service ?? '<unset>'}"`);
     }
@@ -91,17 +71,13 @@ export class MiyoClient {
     return this.alive;
   }
 
-  // No persistent connection to close. Sets `alive` to false so any
-  // queued callers short-circuit. The HTTP server keeps running;
-  // the next MiyoClient.connect() picks it back up.
+  // Marks the client dead so queued callers short-circuit. The HTTP
+  // server keeps running; the next MiyoClient.connect() picks it
+  // back up.
   disconnect(): void {
     this.alive = false;
   }
 
-  // Create-or-get the app folder for an app (chatgpt, claude, ...).
-  // Idempotent. Returns the folder name (for use in writeFile) and
-  // any existing metadata blob inline so the caller can skip a
-  // second GET.
   async ensureAppFolder(appId: SiteId, label: string): Promise<AppFolderInfo> {
     return this.request('POST', `/v0/app-folder`, {
       app_id: appId,
@@ -109,24 +85,27 @@ export class MiyoClient {
     }) as Promise<AppFolderInfo>;
   }
 
-  // Replace the metadata blob for an app. The blob is the
-  // extension's index of what's been captured.
-  async putMetadata(appId: SiteId, metadata: AppFolderMetadata): Promise<void> {
-    await this.request(
-      'PUT',
-      `/v0/app-folder/${encodeURIComponent(appId)}/metadata`,
-      metadata
-    );
+  // Bulk presence check. Returns the subset of itemIds that Miyo
+  // doesn't yet have. Used by the capture loop and by the popup
+  // snapshot's "N new available" probe — one HTTP call per source page.
+  async filterMissing(appId: SiteId, itemIds: string[]): Promise<string[]> {
+    if (itemIds.length === 0) return [];
+    const result = (await this.request(
+      'POST',
+      `/v0/app-folder/${encodeURIComponent(appId)}/items/missing`,
+      { item_ids: itemIds }
+    )) as { missing?: unknown };
+    return Array.isArray(result.missing)
+      ? result.missing.filter((s): s is string => typeof s === 'string')
+      : [];
   }
 
-  // Write one captured item as a markdown file in the app folder.
-  // `force:true` is the right default for re-syncs — the filename
-  // is deterministic per item, so a re-capture at a newer
-  // updated_at should overwrite the prior file cleanly.
+  // Write one captured item. item_id is forwarded so Miyo can index
+  // (app_id, item_id) → filename for the next filterMissing call.
   //
-  // Throws MiyoUnavailableError on connection failure (marks client
-  // dead). Throws a plain Error on per-item failures (4xx/5xx other
-  // than 507); the capture loop handles those as "skip + continue".
+  // Throws MiyoUnavailableError on connection failure or storage-full;
+  // throws a plain Error on per-item failures (4xx/5xx other than 507)
+  // — the capture loop counts those as errors and continues.
   async writeFile(folderName: string, item: CapturedItem): Promise<void> {
     if (!this.alive) {
       throw new MiyoUnavailableError('client marked dead');
@@ -142,6 +121,7 @@ export class MiyoClient {
             folder: folderName,
             filename: item.filename,
             content: item.markdown,
+            item_id: item.item_id,
             force: true,
           }),
         },
@@ -154,8 +134,6 @@ export class MiyoClient {
 
     if (res.ok) return;
 
-    // 507 (out of space) is fatal — propagate as unavailable so the
-    // loop aborts. Other 4xx/5xx are per-item failures.
     if (res.status === 507) {
       this.alive = false;
       throw new MiyoUnavailableError('storage_full');
@@ -172,11 +150,9 @@ export class MiyoClient {
     throw new Error(`POST /v0/file failed: ${detail}`);
   }
 
-  // Generic typed request used by ensureAppFolder and putMetadata.
-  // Connection failures mark the client dead; HTTP-level errors
-  // throw MiyoUnavailableError too (the alternative — partial state
-  // where the client thinks it's connected but Miyo refused — is
-  // worse than aborting the run).
+  // HTTP-level errors throw MiyoUnavailableError too — the alternative
+  // (client thinks it's connected but Miyo refused) is worse than
+  // aborting the run.
   private async request(
     method: 'GET' | 'POST' | 'PUT',
     path: string,

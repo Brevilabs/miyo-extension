@@ -51,6 +51,7 @@ interface UIState {
     phase: 'listing' | 'fetching';
     completed: number;
     total: number | null;
+    note?: string;
   } | null;
   capturePort: chrome.runtime.Port | null;
   banner: { kind: 'info' | 'error'; text: string } | null;
@@ -61,6 +62,21 @@ interface UIState {
   // True while exportPendingAsZip is mid-flight. Used to guard
   // double-trigger (done broadcast + open-time auto-zip).
   zipping: boolean;
+  // True while the fast probe (health + ensureAppFolder) is in
+  // flight. Drives the "Checking Miyo…" header chip. Resolves quickly
+  // — Miyo connected state shows up as soon as the fast snapshot
+  // lands, without waiting for the slow per-site delta probe.
+  probingMiyo: boolean;
+  // True while the slow per-site delta probe is in flight. Drives
+  // the "checking new…" badge inside each Miyo card. Resolves on its
+  // own clock, independent of probingMiyo.
+  probingDeltas: boolean;
+  // User preference: should the popup show Miyo UI when Miyo is
+  // available? Default true. Persisted in chrome.storage.local
+  // under 'miyo_enabled'. Toggling off makes the popup behave as if
+  // Miyo isn't there (local mode UI), even though the SW keeps
+  // probing health in the background.
+  miyoEnabled: boolean;
 }
 
 const ui: UIState = {
@@ -72,7 +88,26 @@ const ui: UIState = {
   banner: null,
   ranges: {},
   zipping: false,
+  probingMiyo: true,
+  probingDeltas: true,
+  miyoEnabled: true,
 };
+
+const MIYO_ENABLED_KEY = 'miyo_enabled';
+
+async function loadMiyoEnabled(): Promise<boolean> {
+  try {
+    const obj = await chrome.storage.local.get(MIYO_ENABLED_KEY);
+    const v = obj[MIYO_ENABLED_KEY];
+    return v !== false; // default true; only explicit false disables
+  } catch {
+    return true;
+  }
+}
+
+function saveMiyoEnabled(): void {
+  void chrome.storage.local.set({ [MIYO_ENABLED_KEY]: ui.miyoEnabled });
+}
 
 const RANGES_STORAGE_KEY = 'time_ranges';
 
@@ -132,8 +167,11 @@ function saveRanges(): void {
   void chrome.storage.local.set({ [RANGES_STORAGE_KEY]: ui.ranges });
 }
 
-function getRange(siteId: SiteId): TimeRange {
-  return ui.ranges[siteId] ?? DEFAULT_TIME_RANGE;
+function getRange(siteId: SiteId, defaultPreset?: TimeRangePreset): TimeRange {
+  const persisted = ui.ranges[siteId];
+  if (persisted) return persisted;
+  if (defaultPreset) return { kind: 'preset', preset: defaultPreset };
+  return DEFAULT_TIME_RANGE;
 }
 
 const PRESET_LABELS: Record<TimeRangePreset, string> = {
@@ -202,11 +240,13 @@ function siteStatus(s: SiteRow, isCapturing: boolean): { cls: string; text: stri
 
 function renderProgress(): string {
   if (!ui.captureProgress) return '';
-  const { phase, completed, total } = ui.captureProgress;
+  const { phase, completed, total, note } = ui.captureProgress;
   let text: string;
   let determinate = false;
-  if (phase === 'listing') {
-    text = completed > 0 ? `Scanning… ${completed} found` : 'Scanning…';
+  if (note) {
+    text = note;
+  } else if (phase === 'listing') {
+    text = 'Looking for new conversations…';
   } else {
     text = total ? `${completed} of ${total}` : `${completed} captured`;
     determinate = total !== null && total > 0;
@@ -218,7 +258,9 @@ function renderProgress(): string {
 }
 
 function renderSiteRow(s: SiteRow): string {
-  const miyoMode = ui.snapshot?.miyo_connected === true;
+  // miyoMode: show Miyo UI for this card. Both gates must be true —
+  // Miyo desktop is reachable AND the user hasn't toggled it off.
+  const miyoMode = ui.snapshot?.miyo_connected === true && ui.miyoEnabled;
   const isCapturing = ui.capturing === s.id;
   const anyBusy = ui.capturing !== null;
   const brand = brandFor(s.id, s.label);
@@ -234,10 +276,8 @@ function renderSiteRow(s: SiteRow): string {
       ? `<span class="site-account">not signed in</span>`
       : '';
 
-  // Body line: only Miyo mode has a meaningful per-site count to
-  // surface (Miyo's total + new-available delta). Local mode keeps
-  // no state, so we leave the body line empty there — the picker
-  // and hint below carry the relevant context.
+  // Miyo card body: count in Miyo, delta badge, and folder_path so
+  // users know where files land.
   let bodyLine = '';
   if (miyoMode) {
     const total = s.miyo_total;
@@ -247,78 +287,80 @@ function renderSiteRow(s: SiteRow): string {
         ? `<strong>${total.toLocaleString()}</strong> in Miyo`
         : '<span class="site-counts">checking Miyo…</span>';
     let newStr = '';
-    if (newCount !== null && newCount > 0) {
+    if (ui.probingDeltas) {
+      // Slow per-site probe in flight — show a pulsing "checking new…"
+      // rather than a stale count.
+      newStr = ` · <span class="checking-badge">checking new…</span>`;
+    } else if (newCount !== null && newCount > 0) {
       const display = `${newCount}${s.new_available_saturated ? '+' : ''}`;
       newStr = ` · <span class="new-items-badge">${display} new available</span>`;
     } else if (newCount === 0) {
       newStr = ` · <span class="all-captured-badge">✓ all captured</span>`;
     }
-    bodyLine = `<div class="site-counts">${totalStr}${newStr}</div>`;
+    const pathLine = s.miyo_folder_path
+      ? `<div class="site-folder-path" title="${escape(s.miyo_folder_path)}">${escape(s.miyo_folder_path)}</div>`
+      : '';
+    bodyLine = `<div class="site-counts">${totalStr}${newStr}</div>${pathLine}`;
   }
 
-  // Local-mode layout is compact: the Download button sits on the
-  // range row to the right of the select. Miyo-mode keeps its
-  // existing actions row (Send to Miyo / Check again, plus Stop).
+  // Unified action layout: range picker on a row with the Refresh
+  // button on the right. Same shape for both modes — only the
+  // backing Store differs (IDB vs Miyo).
   let rangeBlock = '';
   let actionsRow = '';
+
+  const pending = ui.snapshot?.pending_run ?? null;
+  const ownsPending = pending !== null && pending.siteId === s.id;
+  const otherOwnsPending = pending !== null && pending.siteId !== s.id;
+  const isPaused = ownsPending && !isCapturing && pending.status === 'capturing';
 
   if (!s.session?.signedIn) {
     actionsRow = `
       <div class="site-actions">
         <button class="primary-button" data-action="open-site" data-site="${escape(s.id)}">Sign in to ${escape(s.label)} →</button>
       </div>`;
-  } else if (miyoMode) {
-    const hasNew = (s.new_available ?? 0) > 0;
-    const label = isCapturing
-      ? 'Sending…'
-      : hasNew
-        ? `Send to Miyo (${s.new_available}${s.new_available_saturated ? '+' : ''})`
-        : `${REFRESH_ICON}<span>Check again</span>`;
-    const stopBtn = isCapturing
-      ? `<button class="link-button link-button-danger" data-action="cancel" data-site="${escape(s.id)}">Stop</button>`
-      : '';
-    actionsRow = `
-      <div class="site-actions">
-        <button class="primary-button refresh-button" data-action="capture-miyo" data-site="${escape(s.id)}" ${anyBusy && !isCapturing ? 'disabled' : ''}>${label}</button>
-        ${stopBtn}
-      </div>`;
   } else {
-    // Local-mode action depends on the pending-run state for this
-    // site (paused vs idle), or whether some *other* site is the
-    // owner of an in-progress/paused/ready run (gating).
-    const pending = ui.snapshot?.pending_run ?? null;
-    const ownsPending = pending !== null && pending.siteId === s.id;
-    const otherOwnsPending = pending !== null && pending.siteId !== s.id;
-    const isPaused = ownsPending && !isCapturing && pending.status === 'capturing';
-    const range = ownsPending ? pending.range : getRange(s.id);
+    const captureAction = miyoMode ? 'capture-miyo' : 'capture-local';
+    const actionIcon = miyoMode ? REFRESH_ICON : DOWNLOAD_ICON;
+    const actionLabel = miyoMode ? 'Sync to Miyo' : 'Download';
 
     let actionHtml: string;
     if (isCapturing) {
       actionHtml = `<button class="link-button link-button-danger" data-action="cancel" data-site="${escape(s.id)}">Stop</button>`;
     } else if (isPaused) {
       actionHtml = `
-        <button class="primary-button refresh-button site-range-action" data-action="resume" data-site="${escape(s.id)}">${DOWNLOAD_ICON}<span>Resume (${pending.written})</span></button>
+        <button class="primary-button refresh-button site-range-action" data-action="resume" data-site="${escape(s.id)}">${actionIcon}<span>Resume (${pending.written})</span></button>
         <button class="link-button link-button-danger" data-action="discard" data-site="${escape(s.id)}">Discard</button>`;
     } else if (otherOwnsPending) {
-      actionHtml = `<button class="primary-button refresh-button site-range-action" disabled>${DOWNLOAD_ICON}<span>Download</span></button>`;
+      actionHtml = `<button class="primary-button refresh-button site-range-action" disabled>${actionIcon}<span>${actionLabel}</span></button>`;
     } else {
-      actionHtml = `<button class="primary-button refresh-button site-range-action" data-action="capture-local" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>${DOWNLOAD_ICON}<span>Download</span></button>`;
+      actionHtml = `<button class="primary-button refresh-button site-range-action" data-action="${captureAction}" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>${actionIcon}<span>${actionLabel}</span></button>`;
     }
-    rangeBlock = renderRangePicker(s.id, range, actionHtml, isCapturing || isPaused);
+
+    if (miyoMode) {
+      // Miyo mode is "everything new, always" — no range picker, just
+      // the action button in a plain row.
+      actionsRow = `<div class="site-actions">${actionHtml}</div>`;
+    } else {
+      // Local mode keeps the time range picker. Action button is on
+      // the same row as the select, right-aligned.
+      const range = ownsPending ? pending.range : getRange(s.id, '30d');
+      rangeBlock = renderRangePicker(s.id, range, actionHtml, isCapturing || isPaused);
+    }
   }
 
   const progress = isCapturing ? renderProgress() : '';
 
-  // Local-mode footnote. When a pending run exists on a *different*
-  // site, surface the gating reason so the disabled Download button
-  // isn't a mystery.
-  const pending = ui.snapshot?.pending_run ?? null;
-  const otherOwnsPending = pending !== null && pending.siteId !== s.id;
-  const localHint =
-    !miyoMode && s.session?.signedIn
+  // Gating message when another site holds a pending run; otherwise
+  // a local-mode hint about the zip output. Miyo mode is
+  // self-explanatory from the action label.
+  const hint =
+    s.session?.signedIn
       ? otherOwnsPending
         ? `<div class="site-hint">A capture from ${escape(pending.siteId)} is pending — resolve it before starting a new one.</div>`
-        : `<div class="site-hint">Newest first within your range. Bundled into one .zip when finished.</div>`
+        : !miyoMode
+          ? `<div class="site-hint">Downloads conversations in the selected range as a .zip.</div>`
+          : ''
       : '';
 
   return `
@@ -334,7 +376,7 @@ function renderSiteRow(s: SiteRow): string {
       ${rangeBlock}
       ${progress}
       ${actionsRow}
-      ${localHint}
+      ${hint}
     </div>`;
 }
 
@@ -388,9 +430,20 @@ function renderRangePicker(
 
 function renderHeader(): string {
   const miyoConnected = ui.snapshot?.miyo_connected === true;
-  const miyoBadge = miyoConnected
-    ? `<div class="miyo-indicator">● Miyo connected</div>`
-    : '';
+  const miyoActive = miyoConnected && ui.miyoEnabled;
+  let miyoBadge: string;
+  if (ui.probingMiyo) {
+    miyoBadge = `<div class="miyo-indicator miyo-checking">● Checking Miyo…</div>`;
+  } else if (miyoConnected) {
+    // Switch-style toggle; clicking it flips miyoEnabled.
+    miyoBadge = `
+      <button class="miyo-toggle" data-action="toggle-miyo" aria-pressed="${ui.miyoEnabled}">
+        <span class="miyo-toggle-track${ui.miyoEnabled ? ' on' : ''}"><span class="miyo-toggle-thumb"></span></span>
+        <span class="miyo-toggle-label">Miyo</span>
+      </button>`;
+  } else {
+    miyoBadge = '';
+  }
   return `
     <div class="pop-head">
       <div>
@@ -399,7 +452,7 @@ function renderHeader(): string {
       ${miyoBadge}
     </div>
     <p class="pop-tagline">${
-      miyoConnected
+      miyoActive
         ? 'Your Miyo library, kept in sync.'
         : 'Save your AI conversations as local markdown.'
     }</p>
@@ -416,6 +469,11 @@ function renderFooter(): string {
 }
 
 function renderMiyoPromo(): string {
+  // Don't claim Miyo is missing until the fast probe has resolved —
+  // the cached snapshot may be stale.
+  if (ui.probingMiyo) return '';
+  // If Miyo is reachable, never show the install promo — even if the
+  // user has toggled off, they've already installed it.
   if (ui.snapshot?.miyo_connected === true) return '';
   return `
     <a class="miyo-promo" data-action="install-miyo" href="${escape(MIYO_INSTALL_URL)}" target="_blank" rel="noopener noreferrer">
@@ -458,6 +516,7 @@ function render(): void {
       else if (action === 'cancel' && site) onCancel(site);
       else if (action === 'resume') void onResume();
       else if (action === 'discard') void onDiscard();
+      else if (action === 'toggle-miyo') onToggleMiyo();
       else if (action === 'open-site' && site) onOpenSite(site);
     });
   });
@@ -535,14 +594,11 @@ function onCapture(siteId: SiteId, mode: 'local' | 'miyo'): void {
   const port = chrome.runtime.connect({ name: 'capture' });
   ui.capturePort = port;
   render();
-  const startMsg: {
-    type: 'start';
-    site: SiteId;
-    mode: 'local' | 'miyo';
-    range?: TimeRange;
-  } = { type: 'start', site: siteId, mode };
-  if (mode === 'local') startMsg.range = getRange(siteId);
-  port.postMessage(startMsg);
+  // Miyo mode is always "everything new" — no range picker, no user
+  // choice. Local mode uses whatever the user picked (default 30d).
+  const range: TimeRange =
+    mode === 'miyo' ? { kind: 'preset', preset: 'all' } : getRange(siteId, '30d');
+  port.postMessage({ type: 'start', site: siteId, mode, range });
   wirePort(port, siteId);
 }
 
@@ -584,6 +640,12 @@ function onDiscard(): void {
 function onOpenSite(siteId: SiteId): void {
   const site = findSite(siteId);
   if (site) void chrome.tabs.create({ url: site.home_url });
+}
+
+function onToggleMiyo(): void {
+  ui.miyoEnabled = !ui.miyoEnabled;
+  saveMiyoEnabled();
+  render();
 }
 
 // Single-shot guarded by ui.zipping — fired both on 'done' and on
@@ -641,6 +703,7 @@ function wirePort(port: chrome.runtime.Port, siteId: SiteId): void {
         phase: (msg.phase as 'listing' | 'fetching' | undefined) ?? 'fetching',
         completed: msg.completed,
         total: msg.total,
+        note: typeof msg.note === 'string' ? msg.note : undefined,
       };
       render();
       return;
@@ -671,7 +734,9 @@ function wirePort(port: chrome.runtime.Port, siteId: SiteId): void {
                   ? `Sent ${written} to Miyo (${errors} failed).`
                   : `Sent ${written} to Miyo.`,
           };
-          void refresh();
+          // Miyo mode: items are already on disk. Just clear the
+          // pending_run record and refresh.
+          void clearPendingRun().then(() => refresh());
         } else {
           void exportPendingAsZip(done.site);
         }
@@ -720,13 +785,51 @@ function attachToRunningRun(siteId: SiteId): void {
   wirePort(port, siteId);
 }
 
+type DeltaMap = Record<SiteId, { count: number; saturated: boolean }>;
+
+// Merge fresh delta probe results into ui.snapshot.sites. Sites
+// without an entry stay at new_available=null.
+function applyDeltas(deltas: DeltaMap): void {
+  if (!ui.snapshot) return;
+  ui.snapshot.sites = ui.snapshot.sites.map((row) => {
+    const d = deltas[row.id];
+    if (!d) return { ...row, new_available: null, new_available_saturated: false };
+    return { ...row, new_available: d.count, new_available_saturated: d.saturated };
+  });
+}
+
+async function fetchDeltas(): Promise<void> {
+  ui.probingDeltas = true;
+  render();
+  try {
+    const deltas = (await chrome.runtime.sendMessage({ type: 'deltas' })) as DeltaMap;
+    applyDeltas(deltas);
+  } catch {
+    // best-effort — leave badges as "checking new…" or empty
+  } finally {
+    ui.probingDeltas = false;
+    render();
+  }
+}
+
 async function refresh(): Promise<void> {
+  ui.probingMiyo = true;
+  ui.probingDeltas = true;
+  render();
   try {
     ui.snapshot = (await chrome.runtime.sendMessage({ type: 'snapshot' })) as PopupSnapshot;
   } catch (err) {
     ui.banner = { kind: 'error', text: err instanceof Error ? err.message : String(err) };
+  } finally {
+    ui.probingMiyo = false;
+    render();
   }
-  render();
+  if (ui.snapshot?.miyo_connected) {
+    void fetchDeltas();
+  } else {
+    ui.probingDeltas = false;
+    render();
+  }
 }
 
 async function loadCachedSnapshot(): Promise<PopupSnapshot | null> {
@@ -746,8 +849,13 @@ async function loadCachedSnapshot(): Promise<PopupSnapshot | null> {
 async function init(): Promise<void> {
   render();
 
-  const [cached, ranges] = await Promise.all([loadCachedSnapshot(), loadRanges()]);
+  const [cached, ranges, miyoEnabled] = await Promise.all([
+    loadCachedSnapshot(),
+    loadRanges(),
+    loadMiyoEnabled(),
+  ]);
   ui.ranges = ranges;
+  ui.miyoEnabled = miyoEnabled;
   if (cached) {
     ui.snapshot = cached;
     ui.initializing = false;
@@ -771,6 +879,7 @@ async function init(): Promise<void> {
     }
   } finally {
     ui.initializing = false;
+    ui.probingMiyo = false;
     render();
   }
 
@@ -778,6 +887,15 @@ async function init(): Promise<void> {
   const pending = ui.snapshot?.pending_run;
   if (pending && pending.status === 'ready' && !ui.zipping) {
     void exportPendingAsZip(pending.siteId);
+  }
+
+  // Slow per-site delta probe, run after the header chip has flipped
+  // to "Miyo connected". Skip entirely if Miyo isn't there.
+  if (ui.snapshot?.miyo_connected) {
+    void fetchDeltas();
+  } else {
+    ui.probingDeltas = false;
+    render();
   }
 }
 

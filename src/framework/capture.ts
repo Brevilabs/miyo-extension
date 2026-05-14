@@ -1,69 +1,50 @@
 // Capture orchestrator.
 //
-// Two flows:
+// One mode-agnostic loop drives both flows. It walks the adapter's
+// list pages newest-first, bulk-checks the destination store for
+// which item ids are already present, and captures the missing ones.
+// Local mode → IdbStore (buffered, zipped+downloaded by popup at end).
+// Miyo mode  → MiyoStore (files POST'd to the Miyo desktop server).
 //
-//   captureToLocalFiles (local mode — Miyo not installed)
-//     • User picks a time-range window. We page newest-first and
-//       buffer each rendered item into IndexedDB (store.ts). When
-//       the loop finishes we mark the pending run 'completed'; the
-//       popup then zips IDB contents and triggers the download.
-//     • Resumable across browser restarts: items already in IDB are
-//       skipped at the fetch step. The persistent run record
-//       (run-state.ts) tells the popup whether to show "Resume" or
-//       auto-zip-and-download on its next open.
+// Range semantics:
+//   sinceMs   → stop when an item's updated_at falls below it.
+//   untilMs   → skip items above it (newest-first; they're "too new").
+//   sinceMs null → no lower bound. Early-stop kicks in when a page's
+//                  in-range items are all already in the store —
+//                  newest-first ordering means everything below is
+//                  also in store. Without this, "All available" would
+//                  walk the user's entire history on every refresh.
 //
-//   captureToMiyo (Miyo mode)
-//     • No cap. Miyo holds the full library; the extension only sends
-//       the delta.
-//     • Diff: list newest-first, comparing each item against the
-//       app-folder metadata blob; stop at the first clean page.
-//     • POSTs each rendered item as a .md file via /v0/file, and
-//       updates the metadata blob (every FLUSH_EVERY items + at end).
-//
-// If the SW dies mid-run:
-//   • Local mode: items written so far survive in IDB; pending_run
-//     record stays at status='fetching'. Next popup open offers
-//     Resume, which re-enters the loop and skips IDB-present items.
-//   • Miyo mode: the metadata blob (last flushed) is the index. Items
-//     written but not yet recorded in metadata get re-captured next
-//     run (POST /v0/file with force:true is idempotent), so worst-case
-//     redo is FLUSH_EVERY-1 items.
+// Resume:
+//   The capture loop reads pending_run on entry. `cursor` lets us pick
+//   up at the last successfully-walked list page so we don't re-walk
+//   thousands of items after a SW death. `written` and `errors`
+//   continue counting from where they left off.
 
 import { FatalError, paced } from './rate-limit.js';
 import { renderChatConversationMarkdown } from './chat.js';
-import { hasItem, putItem } from './store.js';
 import { readPendingRun, updatePendingRun } from './run-state.js';
 import { makeDatePrefixedFilename } from './filename.js';
-import { MiyoClient, MiyoUnavailableError } from './miyo.js';
-import type {
-  AppFolderMetadata,
-  AppFolderMetadataItem,
-  CapturedItem,
-  ListItem,
-  RenderedItem,
-  SiteAdapter,
-} from './types.js';
+import { MiyoUnavailableError } from './miyo.js';
+import type { CapturedItem, ListItem, RenderedItem, SiteAdapter } from './types.js';
+import type { Store } from './capture-store.js';
 
-// pending_run.{written,errors} are flushed to chrome.storage.local
-// every N captured items, not per item — the storage write per item
-// was visible overhead and the displayed count drifts by at most
-// N-1 on a crash, which the IDB index recovers transparently.
+// pending_run.{written,errors,cursor} are flushed every N captured
+// items. A crash loses at most N items of bookkeeping; the IDB / Miyo
+// store always reflects truth via filterMissing, so resume corrects
+// the count on its first flush.
 const RUN_FLUSH_EVERY = 10;
 
-// Miyo-mode metadata-flush cadence. Trade-off: a higher number means
-// fewer PUTs but more redo on SW death. 25 items × ~1.5s rate-limited
-// fetch = ~40s of work between flushes — small enough that a crash
-// barely matters.
-const META_FLUSH_EVERY = 25;
-
 export interface CaptureCallbacks {
-  // Same shape as before so the popup UI doesn't have to care which
-  // mode is running. `total` may be null while we're still
-  // discovering work.
   onProgress: (p: {
     phase: 'listing' | 'fetching';
     completed: number;
     total: number | null;
+    // Optional override for the popup's progress text. The capture
+    // loop sends this at moments where a generic phase label isn't
+    // specific enough — e.g. "Found 3 new on page 1, fetching…"
+    // right after the first filterMissing call lands.
+    note?: string;
   }) => void;
   isCancelled?: () => boolean;
 }
@@ -71,10 +52,6 @@ export interface CaptureCallbacks {
 export type CaptureResult =
   | { kind: 'completed'; mode: 'local' | 'miyo'; written: number; errors: number }
   | { kind: 'aborted'; reason: string };
-
-// ───────────────────────────────────────────────────────────────────
-// Shared helpers
-// ───────────────────────────────────────────────────────────────────
 
 async function renderForAdapter(
   adapter: SiteAdapter,
@@ -114,53 +91,50 @@ function isSignedOutError(err: unknown): boolean {
   return err instanceof FatalError && (err.status === 401 || err.status === 403);
 }
 
-function emptyMetadata(adapter: SiteAdapter): AppFolderMetadata {
-  return {
-    version: 1,
-    app_id: adapter.id,
-    label: adapter.label,
-    last_sync_at: null,
-    items: {},
-  };
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }
 
-function metadataEntry(item: CapturedItem): AppFolderMetadataItem {
-  return {
-    updated_at: item.updated_at,
-    filename: item.filename,
-    title: item.title,
-    url: item.url,
-    created_at: item.created_at,
-  };
-}
-
-// ───────────────────────────────────────────────────────────────────
-// Local-mode capture (Miyo not installed)
-// ───────────────────────────────────────────────────────────────────
-
-export async function captureToLocalFiles(
+export async function captureToStore(
   adapter: SiteAdapter,
+  store: Store,
+  mode: 'local' | 'miyo',
   sinceMs: number | null,
   untilMs: number | null,
+  // Stop scanning the moment we see an item with updated_at <= this.
+  // Items strictly above it still pass through filterMissing so
+  // "bumped" known items don't get falsely re-captured. Pass null for
+  // a full walk (first sync, or local mode where this concept doesn't
+  // apply).
+  watermark: string | null,
   callbacks: CaptureCallbacks
 ): Promise<CaptureResult> {
   const session = await adapter.probeSession();
   if (!session.signedIn) return { kind: 'aborted', reason: 'signed_out' };
 
-  // Counters resume from the persisted run — the caller is responsible
-  // for having written the PendingRun record (status='capturing')
-  // before invoking us. A first run sees written/errors at 0.
   const existing = await readPendingRun();
   let written = existing?.written ?? 0;
   let errors = existing?.errors ?? 0;
+  let listCursor: string | null = existing?.cursor ?? null;
+  let newestSeen: string | null = existing?.newest_seen ?? null;
   let unflushed = 0;
+
   const flush = async (): Promise<void> => {
     if (unflushed === 0) return;
-    await updatePendingRun({ written, errors });
+    await updatePendingRun({
+      written,
+      errors,
+      cursor: listCursor,
+      newest_seen: newestSeen,
+    });
     unflushed = 0;
   };
 
-  let listCursor: string | null = null;
+  // Early-stop is only safe when the store is monotonically growing
+  // and we've walked from the top — i.e., sinceMs is null (no lower
+  // bound). Bounded ranges always walk to their lower edge.
+  const earlyStopAllowed = sinceMs === null;
+  let firstPageProcessed = false;
 
   while (true) {
     if (callbacks.isCancelled?.()) {
@@ -176,29 +150,80 @@ export async function captureToLocalFiles(
       return { kind: 'aborted', reason: errMessage(err) };
     }
 
+    // Capture the newest item's updated_at the first time we see one
+    // — preserved across resumes via pending_run. On successful Miyo
+    // completion this becomes the new watermark.
+    if (newestSeen === null && page.items.length > 0) {
+      newestSeen = page.items[0]!.updated_at;
+      unflushed += 1;
+    }
+
+    // Filter to in-range items, and detect whether we've crossed
+    // below sinceMs (rangeExhausted) or hit the prior-sync watermark.
+    // The watermark check is what lets a steady-state sync finish
+    // after one list call: items below it are known to be in store.
+    const inRange: ListItem[] = [];
     let rangeExhausted = false;
+    let belowWatermark = false;
     for (const item of page.items) {
-      if (callbacks.isCancelled?.()) {
-        await flush();
-        return { kind: 'aborted', reason: 'cancelled' };
-      }
       const ts = Date.parse(item.updated_at);
-      if (untilMs !== null && ts >= untilMs) continue; // too new — skip
+      if (untilMs !== null && ts >= untilMs) continue;
       if (sinceMs !== null && ts < sinceMs) {
         rangeExhausted = true;
         break;
       }
-      // Resume short-circuit: items already buffered survive across
-      // SW death and browser restarts.
-      if (await hasItem(adapter.id, item.id)) continue;
+      if (watermark !== null && item.updated_at <= watermark) {
+        belowWatermark = true;
+        break;
+      }
+      inRange.push(item);
+    }
+
+    let missing: string[] = [];
+    if (inRange.length > 0) {
+      try {
+        missing = await store.filterMissing(inRange.map((i) => i.id));
+      } catch (err) {
+        await flush();
+        if (err instanceof MiyoUnavailableError) {
+          return { kind: 'aborted', reason: 'miyo_unavailable' };
+        }
+        return { kind: 'aborted', reason: errMessage(err) };
+      }
+    }
+    const missingSet = new Set(missing);
+
+    // First-page feedback: tell the popup what we found so the
+    // "Looking for new conversations…" text gets a concrete update
+    // before the first item fetch finishes (~1.5s of additional wait).
+    if (!firstPageProcessed && missing.length > 0) {
+      callbacks.onProgress({
+        phase: 'listing',
+        completed: 0,
+        total: null,
+        note: `Found ${missing.length} new, fetching…`,
+      });
+    }
+    firstPageProcessed = true;
+
+    for (const item of inRange) {
+      if (!missingSet.has(item.id)) continue;
+      if (callbacks.isCancelled?.()) {
+        await flush();
+        return { kind: 'aborted', reason: 'cancelled' };
+      }
       try {
         const captured = await paced(adapter.id, () => renderForAdapter(adapter, item));
-        await putItem(adapter.id, captured);
+        await store.put(captured);
         written += 1;
       } catch (err) {
         if (isSignedOutError(err)) {
           await flush();
           return { kind: 'aborted', reason: 'signed_out' };
+        }
+        if (err instanceof MiyoUnavailableError) {
+          await flush();
+          return { kind: 'aborted', reason: 'miyo_unavailable' };
         }
         errors += 1;
       }
@@ -207,196 +232,42 @@ export async function captureToLocalFiles(
       callbacks.onProgress({ phase: 'fetching', completed: written, total: null });
     }
 
-    if (rangeExhausted) break;
-    if (page.next_cursor === null) break;
     listCursor = page.next_cursor;
+    unflushed += 1; // mark a page-boundary flush as pending
+    if (unflushed >= RUN_FLUSH_EVERY) await flush();
+
+    if (rangeExhausted) break;
+    if (belowWatermark) break;
+    if (page.next_cursor === null) break;
+    // Early stop: a non-empty page where every in-range item was
+    // already in the store. Newest-first ordering means older pages
+    // are also fully in store.
+    if (earlyStopAllowed && inRange.length > 0 && missing.length === 0) break;
   }
 
   await flush();
-  return { kind: 'completed', mode: 'local', written, errors };
+  return { kind: 'completed', mode, written, errors };
 }
 
-// ───────────────────────────────────────────────────────────────────
-// Miyo-mode helpers
-// ───────────────────────────────────────────────────────────────────
-
-// Probe-only: compute the delta count without fetching anything. Used
-// by the popup-open snapshot to render "N new available". Walks
-// listItems newest-first until it finds a full page where every item
-// is already in the metadata index at matching updated_at, or until
-// it runs out of pages.
-//
-// Saturated = we hit `MAX_PROBE_PAGES` without exhausting; the true
-// new-count is `count` or more. The popup displays "N+" in that case.
+// Probe-only: walk a few pages newest-first asking the store how
+// many items are missing. Used by the popup snapshot's "N new
+// available" indicator (Miyo mode only).
 const MAX_PROBE_PAGES = 4;
 
-export async function probeMiyoDelta(
+export async function probeStoreDelta(
   adapter: SiteAdapter,
-  miyoIndex: Map<string, string>
+  store: Store
 ): Promise<{ count: number; saturated: boolean }> {
   let count = 0;
   let cursor: string | null = null;
   for (let page = 0; page < MAX_PROBE_PAGES; page++) {
     const result = await paced(adapter.id, () => adapter.listItems(cursor));
-    let pageHadNew = false;
-    for (const item of result.items) {
-      const knownAt = miyoIndex.get(item.id);
-      if (!knownAt || knownAt < item.updated_at) {
-        count += 1;
-        pageHadNew = true;
-      }
-    }
-    // Stopping rule: once a page contains zero new-or-updated items,
-    // every subsequent page is also clean — newest-first ordering
-    // means any touched item would have moved up to a page we've
-    // already seen.
-    if (!pageHadNew) return { count, saturated: false };
+    if (result.items.length === 0) return { count, saturated: false };
+    const missing = await store.filterMissing(result.items.map((i) => i.id));
+    count += missing.length;
+    if (missing.length === 0) return { count, saturated: false };
     if (result.next_cursor === null) return { count, saturated: false };
     cursor = result.next_cursor;
   }
   return { count, saturated: true };
-}
-
-// Build the diff index used by probeMiyoDelta and captureToMiyo from
-// a stored metadata blob. Returns an empty map for null/missing
-// metadata (first-time capture).
-export function indexFromMetadata(metadata: AppFolderMetadata | null): Map<string, string> {
-  const out = new Map<string, string>();
-  if (!metadata) return out;
-  for (const [id, entry] of Object.entries(metadata.items)) {
-    out.set(id, entry.updated_at);
-  }
-  return out;
-}
-
-// ───────────────────────────────────────────────────────────────────
-// Miyo-mode capture
-// ───────────────────────────────────────────────────────────────────
-
-export async function captureToMiyo(
-  adapter: SiteAdapter,
-  miyo: MiyoClient,
-  callbacks: CaptureCallbacks
-): Promise<CaptureResult> {
-  const session = await adapter.probeSession();
-  if (!session.signedIn) return { kind: 'aborted', reason: 'signed_out' };
-
-  // Ensure the app folder exists and grab its current metadata. The
-  // POST is idempotent; on a hot path it just returns the existing
-  // folder + metadata.
-  let folderInfo;
-  try {
-    folderInfo = await miyo.ensureAppFolder(adapter.id, adapter.label);
-  } catch (err) {
-    if (err instanceof MiyoUnavailableError) {
-      return { kind: 'aborted', reason: 'miyo_unavailable' };
-    }
-    return { kind: 'aborted', reason: errMessage(err) };
-  }
-  const metadata: AppFolderMetadata = folderInfo.metadata ?? emptyMetadata(adapter);
-  // Refresh label in case the adapter's display name changed since
-  // the prior run. The app_id is immutable per source.
-  metadata.app_id = adapter.id;
-  metadata.label = adapter.label;
-  const miyoIndex = indexFromMetadata(metadata);
-
-  // Phase 1: scan pages newest-first until a clean page is seen.
-  // No page cap — the user clicked Send and explicitly wants the
-  // full delta.
-  const toCapture: ListItem[] = [];
-  let listCursor: string | null = null;
-  while (true) {
-    if (callbacks.isCancelled?.()) return { kind: 'aborted', reason: 'cancelled' };
-    let page;
-    try {
-      page = await paced(adapter.id, () => adapter.listItems(listCursor));
-    } catch (err) {
-      if (isSignedOutError(err)) return { kind: 'aborted', reason: 'signed_out' };
-      return { kind: 'aborted', reason: errMessage(err) };
-    }
-    let pageHadNew = false;
-    for (const item of page.items) {
-      const knownAt = miyoIndex.get(item.id);
-      if (!knownAt || knownAt < item.updated_at) {
-        toCapture.push(item);
-        pageHadNew = true;
-      }
-    }
-    callbacks.onProgress({
-      phase: 'listing',
-      completed: toCapture.length,
-      total: null,
-    });
-    if (!pageHadNew) break;
-    if (page.next_cursor === null) break;
-    listCursor = page.next_cursor;
-  }
-
-  // Phase 2: fetch, write file, record in metadata. Flush metadata to
-  // Miyo every META_FLUSH_EVERY items so a SW death loses at most
-  // that many items of bookkeeping (the file writes themselves are
-  // durable as soon as POST /v0/file returns).
-  let written = 0;
-  let errors = 0;
-  let pendingFlush = 0;
-  const total = toCapture.length;
-
-  for (const item of toCapture) {
-    if (callbacks.isCancelled?.()) {
-      await flushMetadata(miyo, adapter, metadata).catch(() => {});
-      return { kind: 'aborted', reason: 'cancelled' };
-    }
-    if (!miyo.isAlive()) {
-      await flushMetadata(miyo, adapter, metadata).catch(() => {});
-      return { kind: 'aborted', reason: 'miyo_unavailable' };
-    }
-    try {
-      const captured = await paced(adapter.id, () => renderForAdapter(adapter, item));
-      await miyo.writeFile(folderInfo.folder_name, captured);
-      metadata.items[captured.item_id] = metadataEntry(captured);
-      written += 1;
-      pendingFlush += 1;
-      if (pendingFlush >= META_FLUSH_EVERY) {
-        await flushMetadata(miyo, adapter, metadata);
-        pendingFlush = 0;
-      }
-    } catch (err) {
-      if (isSignedOutError(err)) {
-        await flushMetadata(miyo, adapter, metadata).catch(() => {});
-        return { kind: 'aborted', reason: 'signed_out' };
-      }
-      if (err instanceof MiyoUnavailableError) {
-        // No flush — the client is dead.
-        return { kind: 'aborted', reason: 'miyo_unavailable' };
-      }
-      errors += 1;
-    }
-    callbacks.onProgress({ phase: 'fetching', completed: written, total });
-  }
-
-  // Final flush. last_sync_at advances only at successful end-of-run.
-  metadata.last_sync_at = new Date().toISOString();
-  try {
-    await flushMetadata(miyo, adapter, metadata);
-  } catch (err) {
-    if (err instanceof MiyoUnavailableError) {
-      return { kind: 'aborted', reason: 'miyo_unavailable' };
-    }
-    // A failed final flush is bad but not catastrophic — files are
-    // written, items will re-sync next run. Treat as a soft error.
-    errors += 1;
-  }
-  return { kind: 'completed', mode: 'miyo', written, errors };
-}
-
-async function flushMetadata(
-  miyo: MiyoClient,
-  adapter: SiteAdapter,
-  metadata: AppFolderMetadata
-): Promise<void> {
-  await miyo.putMetadata(adapter.id, metadata);
-}
-
-function errMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }

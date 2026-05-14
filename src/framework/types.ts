@@ -33,19 +33,40 @@ export const DEFAULT_TIME_RANGE: TimeRange = { kind: 'preset', preset: '30d' };
 // chrome.storage.local so it survives browser restarts — the actual
 // captured items live in IndexedDB (see framework/store.ts).
 //
+// One persistent record covers both local and Miyo runs.
+//
 // Lifecycle:
 //   capturing → SW is (or was) capturing. If SW isn't running it
 //               now, the run is "paused"; the popup offers Resume.
-//   ready     → capture loop finished. The popup zips IDB contents
-//               and triggers a download, then clears both the
-//               record and the IDB items.
+//   ready     → capture loop finished. In local mode the popup
+//               zips IDB contents and triggers a download. In Miyo
+//               mode files are already on disk in Miyo's app
+//               folder — the popup just shows a completion banner.
+//               Either way, status='ready' triggers cleanup of
+//               this record (and IDB items, in local mode).
+//
+// `cursor` is the source-adapter's last-seen list cursor. Saving it
+// per page lets resume after a crash skip pages we already walked,
+// which matters when sinceMs is null (otherwise the loop could
+// re-walk a 10k-item history).
+//
+// `mode` distinguishes local (zip-at-end) vs miyo (files already
+// landed) so the done-handler knows what to do at ready.
 export interface PendingRun {
   siteId: SiteId;
+  mode: 'local' | 'miyo';
   range: TimeRange;
   started_at: number; // epoch ms
   status: 'capturing' | 'ready';
   written: number;
   errors: number;
+  cursor: string | null;
+  // ISO updated_at of the newest item seen on this run's first page.
+  // Set once at the very start of the run; preserved across resumes
+  // so an aborted-then-resumed run still records the right value.
+  // On successful Miyo completion, copied to miyo_watermarks so the
+  // next sync can stop early at this boundary.
+  newest_seen: string | null;
 }
 
 export interface SiteSession {
@@ -180,11 +201,14 @@ export interface SiteRow {
   session: SiteSession | null;
 
   // Miyo-mode bookkeeping. Populated when Miyo is connected.
-  // total: how many conversations Miyo has stored for this site.
-  // new_available: how many newer conversations the site has that
-  // Miyo doesn't (or has at a stale updated_at). Saturated when our
-  // diff probe filled its first list page without exhausting.
+  // miyo_total: count of items Miyo has stored for this app_id.
+  // miyo_folder_path: absolute on-disk path of the app folder (shown
+  //   in the popup so users know where files land).
+  // new_available: how many items the source has that Miyo doesn't.
+  //   Saturated when our diff probe ran the page cap without finding
+  //   a fully-known page.
   miyo_total: number | null;
+  miyo_folder_path: string | null;
   new_available: number | null;
   new_available_saturated: boolean;
 }

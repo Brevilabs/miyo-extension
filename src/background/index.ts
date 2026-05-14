@@ -21,18 +21,18 @@
 //   • Per-site state, sync progress, meta reconciliation. All gone.
 
 import { ADAPTERS, getAdapter } from '../adapters/index.js';
-import {
-  captureToLocalFiles,
-  captureToMiyo,
-  indexFromMetadata,
-  probeMiyoDelta,
-} from '../framework/capture.js';
+import { captureToStore, probeStoreDelta } from '../framework/capture.js';
+import { IdbStore, MiyoStore } from '../framework/capture-store.js';
+import type { Store } from '../framework/capture-store.js';
 import { MiyoClient, MiyoUnavailableError } from '../framework/miyo.js';
+import type { AppFolderInfo } from '../framework/miyo.js';
 import { clearItems } from '../framework/store.js';
 import {
   clearPendingRun,
   readPendingRun,
+  readMiyoWatermark,
   updatePendingRun,
+  writeMiyoWatermark,
   writePendingRun,
 } from '../framework/run-state.js';
 import type {
@@ -138,74 +138,47 @@ async function probeSession(adapter: SiteAdapter): Promise<SiteSession> {
   }
 }
 
+// Build a row WITHOUT the slow per-site delta probe. miyo_total +
+// folder_path come from the cheap ensureAppFolder call; new_available
+// is left null and the popup fills it in via a separate `deltas`
+// message once the slow probe resolves.
 async function buildRow(
   adapter: SiteAdapter,
-  miyoIndexFor: Map<string, string> | null
+  miyoFolder: AppFolderInfo | null
 ): Promise<SiteRow> {
-  const sessionPromise = probeSession(adapter);
-
-  // When Miyo is connected we compute the live delta against its
-  // index. The probe is a single listItems call per site, paged up to
-  // MAX_PROBE_PAGES (see capture.ts) — fast enough for popup open.
-  let miyoTotal: number | null = null;
-  let newAvailable: number | null = null;
-  let newSaturated = false;
-
-  if (miyoIndexFor) {
-    miyoTotal = miyoIndexFor.size;
-    const session = await sessionPromise;
-    if (session.signedIn) {
-      try {
-        const probe = await probeMiyoDelta(adapter, miyoIndexFor);
-        newAvailable = probe.count;
-        newSaturated = probe.saturated;
-      } catch {
-        // Best-effort. UI shows "—" for unknown counts.
-      }
-    }
-  }
-
-  const session = await sessionPromise;
-
+  const session = await probeSession(adapter);
   return {
     id: adapter.id,
     label: adapter.label,
     home_url: adapter.home_url,
     brand_color: adapter.brand_color ?? null,
     session,
-    miyo_total: miyoTotal,
-    new_available: newAvailable,
-    new_available_saturated: newSaturated,
+    miyo_total: miyoFolder?.count ?? null,
+    miyo_folder_path: miyoFolder?.folder_path ?? null,
+    new_available: null,
+    new_available_saturated: false,
   };
 }
 
 async function buildSnapshot(): Promise<PopupSnapshot> {
-  // Force a fresh /v0/health probe on every popup open — see getMiyo()
-  // comment for why we drop the cache here.
   const client = await getMiyo(true);
-  let miyoIndices: Map<SiteId, Map<string, string>> | null = null;
+  const miyoFolders = new Map<SiteId, AppFolderInfo>();
 
   if (client) {
-    miyoIndices = new Map();
-    // Ensure the app folder + read metadata for each source in
-    // parallel. ensureAppFolder is idempotent and returns the
-    // existing metadata inline so we don't need a second GET.
-    // Tolerate per-source failure — show "—" for that row instead
-    // of failing the whole snapshot.
     await Promise.all(
       ADAPTERS.map(async (a) => {
         try {
           const info = await client.ensureAppFolder(a.id, a.label);
-          miyoIndices!.set(a.id, indexFromMetadata(info.metadata));
+          miyoFolders.set(a.id, info);
         } catch {
-          miyoIndices!.set(a.id, new Map());
+          // Tolerate per-source failure — that row shows no Miyo data.
         }
       })
     );
   }
 
   const [sites, pendingRun] = await Promise.all([
-    Promise.all(ADAPTERS.map((a) => buildRow(a, miyoIndices?.get(a.id) ?? null))),
+    Promise.all(ADAPTERS.map((a) => buildRow(a, miyoFolders.get(a.id) ?? null))),
     readPendingRun(),
   ]);
 
@@ -215,11 +188,34 @@ async function buildSnapshot(): Promise<PopupSnapshot> {
     pending_run: pendingRun,
   };
 
-  // Cache for stale-while-revalidate in the popup. Best-effort —
-  // a storage write failure shouldn't fail the snapshot.
   void chrome.storage.local.set({ last_snapshot: snapshot });
-
   return snapshot;
+}
+
+// Per-site delta probe. Up to MAX_PROBE_PAGES rate-limited list-page
+// calls per site (slow — that's why this is split off from buildSnapshot).
+// Returns an empty record if Miyo isn't connected.
+async function probeDeltas(): Promise<
+  Record<SiteId, { count: number; saturated: boolean }>
+> {
+  const client = await getMiyo();
+  if (!client) return {};
+  const out: Record<SiteId, { count: number; saturated: boolean }> = {};
+  await Promise.all(
+    ADAPTERS.map(async (a) => {
+      try {
+        const session = await a.probeSession();
+        if (!session.signedIn) return;
+        const folder = await client.ensureAppFolder(a.id, a.label);
+        const store = new MiyoStore(client, a.id, folder.folder_name);
+        const probe = await probeStoreDelta(a, store);
+        out[a.id] = { count: probe.count, saturated: probe.saturated };
+      } catch {
+        // best-effort; missing entries stay null in the popup
+      }
+    })
+  );
+  return out;
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -287,6 +283,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     try {
       if (msg?.type === 'snapshot') {
         sendResponse(await buildSnapshot());
+        return;
+      }
+      if (msg?.type === 'deltas') {
+        sendResponse(await probeDeltas());
         return;
       }
       sendResponse({ error: 'unknown_message' });
@@ -378,7 +378,7 @@ chrome.runtime.onConnect.addListener((port) => {
           return;
         }
         siteId = run.siteId;
-        mode = 'local';
+        mode = run.mode;
         range = run.range;
         await writePendingRun({ ...run, status: 'capturing' });
       } else {
@@ -420,7 +420,10 @@ chrome.runtime.onConnect.addListener((port) => {
         return;
       }
 
-      if (mode === 'local' && !isResume) {
+      // Fresh start (not resume): refuse if any pending run already
+      // exists. The popup is responsible for surfacing that and asking
+      // the user to resolve (resume/discard/download).
+      if (!isResume) {
         const existing = await readPendingRun();
         if (existing) {
           safePost({
@@ -433,11 +436,14 @@ chrome.runtime.onConnect.addListener((port) => {
         const usedRange: TimeRange = range ?? DEFAULT_TIME_RANGE;
         await writePendingRun({
           siteId: adapter.id,
+          mode,
           range: usedRange,
           started_at: Date.now(),
           status: 'capturing',
           written: 0,
           errors: 0,
+          cursor: null,
+          newest_seen: null,
         });
         range = usedRange;
       }
@@ -463,10 +469,12 @@ chrome.runtime.onConnect.addListener((port) => {
             phase,
             completed,
             total,
+            note,
           }: {
             phase: 'listing' | 'fetching';
             completed: number;
             total: number | null;
+            note?: string;
           }) => {
             entry.progress = { phase, completed, total };
             broadcast(entry, {
@@ -475,39 +483,91 @@ chrome.runtime.onConnect.addListener((port) => {
               phase,
               completed,
               total,
+              note,
             });
           },
           isCancelled: () => entry.cancelRequested,
         };
 
+        const usedRange: TimeRange = range ?? DEFAULT_TIME_RANGE;
+        const { sinceMs, untilMs } = rangeToWindow(usedRange);
+
+        // Watermark only applies to Miyo mode with no lower range
+        // bound — it's the "last successful sync's high water" used
+        // to stop early on incremental syncs. Local mode wipes its
+        // store after each zip, so the concept doesn't apply.
+        const watermark =
+          mode === 'miyo' && sinceMs === null
+            ? await readMiyoWatermark(adapter.id)
+            : null;
+
+        let store: Store;
         let result;
         if (mode === 'miyo') {
           const client = await getMiyo();
           if (!client) {
             result = { kind: 'aborted' as const, reason: 'miyo_unavailable' };
           } else {
-            result = await captureToMiyo(adapter, client, callbacks);
+            try {
+              const folder = await client.ensureAppFolder(adapter.id, adapter.label);
+              store = new MiyoStore(client, adapter.id, folder.folder_name);
+            } catch (err) {
+              const reason =
+                err instanceof MiyoUnavailableError
+                  ? 'miyo_unavailable'
+                  : err instanceof Error
+                    ? err.message
+                    : String(err);
+              result = { kind: 'aborted' as const, reason };
+              store = null as unknown as Store;
+            }
+            if (!result) {
+              result = await captureToStore(
+                adapter,
+                store!,
+                'miyo',
+                sinceMs,
+                untilMs,
+                watermark,
+                callbacks
+              );
+            }
           }
         } else {
-          const usedRange: TimeRange = range ?? DEFAULT_TIME_RANGE;
-          const { sinceMs, untilMs } = rangeToWindow(usedRange);
-          result = await captureToLocalFiles(adapter, sinceMs, untilMs, callbacks);
+          store = new IdbStore(adapter.id);
+          result = await captureToStore(
+            adapter,
+            store,
+            'local',
+            sinceMs,
+            untilMs,
+            null,
+            callbacks
+          );
         }
 
-        // Completion → 'ready' (popup will zip + clear). Cancellation
-        // → wipe items + record. Other aborts → leave paused for
-        // user retry.
-        if (mode === 'local') {
-          if (result.kind === 'completed') {
-            await updatePendingRun({
-              status: 'ready',
-              written: result.written,
-              errors: result.errors,
-            });
-          } else if (result.reason === 'cancelled') {
-            await clearItems(adapter.id);
-            await clearPendingRun();
+        // Completion → status='ready'. Local: popup will zip + clear.
+        // Miyo: files are already on disk; popup just shows banner +
+        // clears the record. Also advance the Miyo watermark so the
+        // next sync stops at this run's boundary instead of walking
+        // pages it already covered.
+        // Cancellation → wipe items + record. Other aborts → leave
+        // paused so the user can Resume.
+        if (result.kind === 'completed') {
+          if (mode === 'miyo') {
+            const run = await readPendingRun();
+            if (run?.newest_seen) {
+              await writeMiyoWatermark(adapter.id, run.newest_seen);
+            }
           }
+          await updatePendingRun({
+            status: 'ready',
+            written: result.written,
+            errors: result.errors,
+          });
+        } else if (result.reason === 'cancelled') {
+          if (mode === 'local') await clearItems(adapter.id);
+          await clearPendingRun();
         }
 
         broadcast(entry, { type: 'done', site: adapter.id, result });
