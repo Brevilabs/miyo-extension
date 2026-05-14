@@ -1,8 +1,63 @@
 // Cross-cutting types shared by the framework, adapters, and UI.
+//
+// The extension is intentionally stateless across runs. There is no
+// persistent SiteState, SyncProgress, or per-item cache — each
+// capture run is a fresh one-shot. The only data that persists is:
+//   • Miyo mode: nothing locally. Miyo holds the index.
+//   • Local mode: nothing locally. Files in the user's Downloads
+//     folder are the source of truth; reruns overwrite cleanly.
+// Small UI prefs (time_ranges, last_snapshot) still live in
+// chrome.storage.local but never hold per-item state.
 
 import type { ChatConversation } from './chat.js';
 
 export type SiteId = string;
+
+// Capture destination: 'local' buffers to IDB and zips at the end;
+// 'miyo' streams items directly into the Miyo desktop app folder.
+export type CaptureMode = 'local' | 'miyo';
+
+// Zip-mode capture range. Two shapes:
+//   • Preset: a now-relative window. The upper bound is implicit
+//     "now"; the lower bound is preset-defined. 'all' means no lower
+//     bound — paginate until exhausted or the safety cap kicks in.
+//   • Custom: an explicit [sinceISODate, untilISODate] window in the
+//     user's local timezone (start-of-day for `since`, end-of-day for
+//     `until`, both inclusive). Use the window form when filling a
+//     gap from a previous run that stopped mid-way.
+export type TimeRangePreset = '24h' | '7d' | '30d' | '90d' | 'all';
+
+export type TimeRange =
+  | { kind: 'preset'; preset: TimeRangePreset }
+  | { kind: 'custom'; sinceISODate: string; untilISODate: string };
+
+export const DEFAULT_TIME_RANGE: TimeRange = { kind: 'preset', preset: '30d' };
+
+// At most one local-mode capture runs at a time. The record lives in
+// chrome.storage.local so it survives browser restarts — the actual
+// captured items live in IndexedDB (see framework/store.ts).
+//
+// `capturing` covers both in-flight (SW running) and paused (SW
+// killed); the popup distinguishes by whether the SW reports an
+// in-flight run. `ready` is the popup's cue to finalize: local
+// zips IDB, Miyo just clears the record.
+//
+// `cursor` lets resume skip pages already walked — important for
+// the "All available" + huge-history case where re-walking the
+// whole source would take many minutes.
+export interface PendingRun {
+  siteId: SiteId;
+  mode: CaptureMode;
+  range: TimeRange;
+  started_at: number; // epoch ms
+  status: 'capturing' | 'ready';
+  written: number;
+  errors: number;
+  cursor: string | null;
+  // Set once on the first page; preserved across resumes. Promoted to
+  // miyo_watermarks on successful Miyo completion only.
+  newest_seen: string | null;
+}
 
 export interface SiteSession {
   signedIn: boolean;
@@ -11,16 +66,17 @@ export interface SiteSession {
 
 export interface ListItem {
   id: string;
-  // ISO 8601. Used by the framework for delta-sync cursor logic. The
-  // adapter must return list pages sorted newest-first.
+  // ISO 8601. The framework compares this against Miyo's known
+  // `updated_at` (or against the local cache) to decide whether a
+  // conversation needs re-fetch. Adapters must return list pages
+  // sorted newest-first.
   updated_at: string;
 }
 
 export interface ItemListPage {
   items: ListItem[];
   // Opaque cursor passed back to listItems(); null means no further
-  // pages. Adapters encode whatever pagination scheme the site uses
-  // (offset, page token, …).
+  // pages. Adapters encode whatever pagination scheme the site uses.
   next_cursor: string | null;
   // Best estimate of total items, if the site reports it. Drives
   // progress UI; null when unknown.
@@ -28,11 +84,10 @@ export interface ItemListPage {
 }
 
 // What a custom adapter returns from fetchItem. The framework forwards
-// `body` to the writer with the given `filename`.
+// `body` to the cache or to Miyo with the given `filename`.
 //
 // `filename` MUST be deterministic: the same item id with the same
-// content state must always produce the same filename, so re-writes
-// overwrite cleanly.
+// content state must always produce the same filename.
 export interface RenderedItem {
   filename: string;
   body: string;
@@ -44,38 +99,33 @@ interface BaseSiteAdapter {
   label: string;
 
   // The site's home page; used for "open ChatGPT" / "open Claude"
-  // affordances and recorded in the destination folder's
-  // .miyo-capture.json for tools that consume the folder.
+  // affordances when the user is signed out.
   home_url: string;
 
-  // Optional display metadata recorded in the destination folder's
-  // .miyo-capture.json so any consumer (Miyo Desktop, future tools)
-  // can render the source without a hardcoded list.
+  // Optional display metadata. Recorded in the markdown frontmatter
+  // for Miyo / Obsidian to render the source consistently.
   brand_color?: string; // hex, e.g. "#10a37f"
-  icon_data_url?: string; // inline SVG as a data: URL
 
   // Returns user identity if signed in. Never throws on a logged-out
   // browser — return { signedIn: false } instead.
   probeSession(): Promise<SiteSession>;
 
   // One page of item refs, sorted newest-first. The framework stops
-  // paging once it sees an updated_at <= the last successful sync's
-  // cursor.
+  // paging based on its mode (200-cap in zip mode, diff-with-Miyo in
+  // Miyo mode).
   listItems(cursor: string | null): Promise<ItemListPage>;
 }
 
-// Chat-shaped adapter. Submits a normalized ChatConversation; the
-// framework derives the filename and renders the markdown. This keeps
-// chat output uniform across every chat provider so a captured folder
-// reads as one corpus rather than per-vendor formats.
+// Chat-shaped adapter. Returns ChatConversation; the framework
+// derives the filename and renders the markdown so output is uniform
+// across providers.
 export interface ChatSiteAdapter extends BaseSiteAdapter {
   kind: 'chat';
   fetchConversation(id: string): Promise<ChatConversation>;
 }
 
 // Custom adapter. Owns its own filename and markdown body. Used for
-// sites whose data is not chat-shaped (notes, bookmarks, documents,
-// emails, RSS items).
+// future non-chat sources (notes, bookmarks, documents).
 export interface CustomSiteAdapter extends BaseSiteAdapter {
   kind: 'custom';
   fetchItem(id: string): Promise<RenderedItem>;
@@ -83,82 +133,56 @@ export interface CustomSiteAdapter extends BaseSiteAdapter {
 
 export type SiteAdapter = ChatSiteAdapter | CustomSiteAdapter;
 
-// Per-site, per-installation persistent state in chrome.storage.local
-// under `state:<siteId>`. Survives browser restarts.
-//
-// Note: the captures map (which conversations have been written) is
-// NOT here — it lives in .miyo-capture.json inside the destination
-// folder, which is the source of truth for dedup. SiteState only
-// holds things that don't belong in the destination folder.
-export interface SiteState {
-  // Highest `updated_at` we have successfully synced (only advances
-  // when a sync run finishes; partial runs leave it unchanged).
-  // SyncProgress.pending_items handles intra-run resumability.
-  //
-  // Mirrors sync.cursor_updated_at in .miyo-capture.json. On Chrome
-  // the meta file is authoritative; on Firefox/Safari (downloads-only,
-  // no read-back) this is the only record.
-  cursor_updated_at: string | null;
-
-  // Last sign-in probe, cached for popup display so it doesn't wait
-  // on a network call to render.
-  last_session: SiteSession | null;
-  last_probe_at: number | null;
-
-  // Last sync outcome.
-  last_sync_at: number | null;
-  last_sync_error: string | null;
+// One rendered item, fully serialized. The unit of cache, export,
+// and the file write to Miyo. Generic across sources — a chat
+// conversation is one shape of item; future shapes (notes, bookmarks,
+// emails) use the same envelope.
+export interface CapturedItem {
+  item_id: string;
+  updated_at: string;
+  title: string;
+  url: string;
+  created_at: string | null;
+  filename: string;
+  markdown: string;
+  // Source-specific extras. Adapters can use this for things like
+  // message_count, tags, author, etc. that don't fit the common
+  // envelope. Currently unused by the framework; reserved.
+  extra?: Record<string, unknown>;
 }
 
-// In-progress sync state. Stored in chrome.storage.local under
-// `progress:<siteId>` and cleared once the sync finishes or
-// permanently aborts.
-export interface SyncProgress {
-  started_at: number;
-  total: number | null;
-  completed: number;
-  list_cursor: string | null;
-  // Each entry carries the item's own updated_at so the captures map
-  // in .miyo-capture.json records per-item timestamps faithfully,
-  // rather than the page-max running watermark.
-  pending_items: Array<{ id: string; updated_at: string }>;
-  errors: Array<{ item_id: string; message: string }>;
-  list_exhausted: boolean;
-}
-
-// Per-site row in the popup. Composes config (enabled / paused /
-// destination), state (session, last sync), and folder-derived info
-// (capture count from meta).
-export interface SiteRowSnapshot {
+// What the popup needs to render one site card. Built freshly on
+// every popup open; not persisted.
+export interface SiteRow {
   id: SiteId;
   label: string;
   home_url: string;
+  brand_color: string | null;
 
-  // Config
-  enabled: boolean;
-  paused: boolean;
-  destination_kind: 'folder' | 'downloads' | null;
-  destination_label: string | null; // e.g. "Notes/ChatGPT" or "~/Downloads/Miyo Captures/ChatGPT"
-  destination_missing: boolean; // handle gone from IndexedDB — destination must be re-picked
-  destination_needs_reauth: boolean; // handle present but permission not granted this session
-
-  // Folder-derived (null on downloads-only browsers where we can't read)
-  captures_count: number | null;
-
-  // Session + sync history
+  // Session probe, attempted on popup open. Null = not yet probed.
   session: SiteSession | null;
-  last_sync_at: number | null;
-  last_sync_error: string | null;
+
+  // Miyo-mode bookkeeping. Populated when Miyo is connected.
+  // miyo_total: count of items Miyo has stored for this app_id.
+  // miyo_folder_path: absolute on-disk path of the app folder (shown
+  //   in the popup so users know where files land).
+  // new_available: how many items the source has that Miyo doesn't.
+  //   Saturated when our diff probe ran the page cap without finding
+  //   a fully-known page.
+  miyo_total: number | null;
+  miyo_folder_path: string | null;
+  new_available: number | null;
+  new_available_saturated: boolean;
 }
 
+// Background → popup snapshot. Contains everything needed for a
+// single render pass.
 export interface PopupSnapshot {
-  sites: SiteRowSnapshot[];
-  active_sync: {
-    site: SiteId;
-    completed: number;
-    total: number | null;
-  } | null;
+  miyo_connected: boolean;
+  sites: SiteRow[];
+  // The single in-flight or completed-but-not-downloaded local-mode
+  // run, if any. Drives popup decisions: which card shows Resume,
+  // whether to auto-zip on open, whether to gate other sites'
+  // Download buttons.
+  pending_run: PendingRun | null;
 }
-// Note: showDirectoryPicker capability is checked in the popup (window
-// context), not here — the background service worker is a
-// ServiceWorkerGlobalScope and never has the API regardless of browser.

@@ -1,125 +1,292 @@
 // Service worker entry.
 //
-// Responsibilities:
-//   1. Snapshot building for the popup. Composes per-site config
-//      (enabled / paused / destination), state (session, last sync),
-//      and folder-derived info (capture count read from the
-//      .miyo-capture.json in the destination folder, when available).
-//   2. Session probing — runs each enabled adapter's probeSession on
-//      startup, install, and on popup-driven refresh.
-//   3. The sync orchestrator's host. The popup opens a port named
-//      'sync' and tells us which site to sync; we run runSync and
-//      pipe progress back over the port.
+// Responsibilities, in order of complexity:
 //
-// We deliberately do NOT auto-sync. The only trigger is a user
-// clicking Sync now in the popup. There are no alarms, no cookie
-// listeners that fan out to fetches, no timers.
+//   1. Snapshot building. The popup opens a port and asks for a
+//      snapshot; we probe each site's session, try to talk to Miyo,
+//      and (when Miyo answers) compute a per-site delta count. The
+//      whole probe completes in ~1 s and the popup renders once.
 //
-// Per-site config writes (enable / disable / pause / resume / set
-// destination) are handled directly by the popup writing to
-// chrome.storage.local and IndexedDB. They do not require the
-// background to mediate.
+//   2. Capture dispatch. The popup tells us to capture a site in
+//      either 'zip' or 'miyo' mode; we own the run so it survives
+//      popup-close. Progress streams back over the port.
+//
+//   3. Badge animation while a run is in flight.
+//
+// What we DO NOT do anymore:
+//   • chrome.alarms keepalive. A 200-item run finishes well inside
+//     the SW idle threshold; if it dies, the cache (zip) or Miyo's
+//     index (Miyo) makes the retry idempotent.
+//   • Folder permissions, destinations, downloads-fallback. All gone.
+//   • Per-site state, sync progress, meta reconciliation. All gone.
 
 import { ADAPTERS, getAdapter } from '../adapters/index.js';
-import { runSync } from '../framework/sync.js';
-import { getSiteState, patchSiteState } from '../framework/state.js';
-import { getSiteConfig, getFolderHandle } from '../framework/destinations.js';
-import { makeWriter } from '../framework/writer.js';
-import type { PopupSnapshot, SiteAdapter, SiteRowSnapshot } from '../framework/types.js';
+import { captureToStore, probeStoreDelta } from '../framework/capture.js';
+import { IdbStore, MiyoStore } from '../framework/capture-store.js';
+import type { Store } from '../framework/capture-store.js';
+import { MiyoClient, MiyoUnavailableError } from '../framework/miyo.js';
+import type { AppFolderInfo } from '../framework/miyo.js';
+import { clearItems } from '../framework/store.js';
+import {
+  clearPendingRun,
+  readPendingRun,
+  readMiyoWatermark,
+  updatePendingRun,
+  writeMiyoWatermark,
+  writePendingRun,
+} from '../framework/run-state.js';
+import type {
+  CaptureMode,
+  PopupSnapshot,
+  SiteAdapter,
+  SiteId,
+  SiteRow,
+  SiteSession,
+  TimeRange,
+} from '../framework/types.js';
+import { DEFAULT_TIME_RANGE } from '../framework/types.js';
 
-async function buildSiteRow(adapter: SiteAdapter): Promise<SiteRowSnapshot> {
-  const [config, state] = await Promise.all([
-    getSiteConfig(adapter.id),
-    getSiteState(adapter.id),
-  ]);
-
-  let destinationLabel: string | null = null;
-  let destinationMissing = false;
-  let capturesCount: number | null = null;
-
-  if (config.destination?.kind === 'downloads') {
-    destinationLabel = `~/Downloads/${config.destination.subpath}`;
-  } else if (config.destination?.kind === 'folder') {
-    const handle = await getFolderHandle(adapter.id);
-    if (!handle) {
-      destinationMissing = true;
-      destinationLabel = '(folder no longer available)';
-    } else {
-      destinationLabel = handle.name;
-      // Best-effort read of meta to surface the capture count. Failures
-      // here (including permission issues) just leave the count null —
-      // we don't try to diagnose permission state from the SW since
-      // queryPermission cross-context is unreliable. The popup does
-      // the real permission check in its window context.
-      try {
-        const wr = await makeWriter(adapter.id, config);
-        if (wr.ok) {
-          const meta = await wr.writer.readMeta();
-          if (meta) capturesCount = Object.keys(meta.captures).length;
-        }
-      } catch {
-        // Ignored; popup will reconcile.
-      }
-    }
+// Convert a TimeRange to an epoch-ms window [sinceMs, untilMs) for
+// capture filtering. Either bound may be null for open-ended.
+//
+// Presets are now-relative: untilMs is open-ended (null) so newly
+// arrived items are included. Custom uses an inclusive end date:
+// untilMs is set to the day *after* `untilISODate` at 00:00 local, so
+// the user-picked end date is fully included in the window.
+function rangeToWindow(range: TimeRange): {
+  sinceMs: number | null;
+  untilMs: number | null;
+} {
+  const DAY_MS = 86_400_000;
+  if (range.kind === 'custom') {
+    const sinceMs = Date.parse(`${range.sinceISODate}T00:00`);
+    const untilStart = new Date(`${range.untilISODate}T00:00`);
+    const untilMs = Number.isFinite(untilStart.getTime())
+      ? untilStart.getTime() + DAY_MS // exclusive upper = start of next day
+      : null;
+    return {
+      sinceMs: Number.isFinite(sinceMs) ? sinceMs : null,
+      untilMs,
+    };
   }
+  const now = Date.now();
+  let sinceMs: number | null;
+  switch (range.preset) {
+    case '24h':
+      sinceMs = now - DAY_MS;
+      break;
+    case '7d':
+      sinceMs = now - 7 * DAY_MS;
+      break;
+    case '30d':
+      sinceMs = now - 30 * DAY_MS;
+      break;
+    case '90d':
+      sinceMs = now - 90 * DAY_MS;
+      break;
+    case 'all':
+      sinceMs = null;
+      break;
+  }
+  return { sinceMs, untilMs: null };
+}
 
+// ──────────────────────────────────────────────────────────────────
+// Miyo client lifecycle
+// ──────────────────────────────────────────────────────────────────
+//
+// One MiyoClient cache pointer in the SW. Re-probed fresh on every
+// popup snapshot (`forceProbe: true`) so the connected/disconnected
+// state always reflects Miyo's current liveness — not a stale "we
+// connected earlier this session" reading. Within a single capture
+// run, the run holds its own client reference, so wiping the cache
+// here doesn't disturb it.
+//
+// For non-snapshot callers (the capture dispatch path), we still
+// reuse the cache if it's alive — a single popup interaction does
+// snapshot → start capture, so the capture inherits the fresh probe.
+
+let miyo: MiyoClient | null = null;
+
+async function getMiyo(forceProbe = false): Promise<MiyoClient | null> {
+  if (!forceProbe && miyo && miyo.isAlive()) return miyo;
+  // Drop the cache pointer (do NOT call disconnect() — that would
+  // mark an in-flight capture's client dead).
+  miyo = null;
+  try {
+    miyo = await MiyoClient.connect();
+    return miyo;
+  } catch (err) {
+    // Expected for every user without the Miyo desktop app — keep
+    // quiet here, the zip-mode UI is the answer.
+    if (!(err instanceof MiyoUnavailableError)) {
+      console.warn('miyo connect failed', err);
+    }
+    miyo = null;
+    return null;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Snapshot
+// ──────────────────────────────────────────────────────────────────
+
+async function probeSession(adapter: SiteAdapter): Promise<SiteSession> {
+  try {
+    return await adapter.probeSession();
+  } catch {
+    return { signedIn: false, email: null };
+  }
+}
+
+// Fast portion of the snapshot: counts + folder path from
+// ensureAppFolder. new_available is left null; the popup fetches
+// it via a separate `deltas` message after this returns.
+async function buildRow(
+  adapter: SiteAdapter,
+  miyoFolder: AppFolderInfo | null
+): Promise<SiteRow> {
+  const session = await probeSession(adapter);
   return {
     id: adapter.id,
     label: adapter.label,
     home_url: adapter.home_url,
-    enabled: config.enabled,
-    paused: config.paused,
-    destination_kind: config.destination?.kind ?? null,
-    destination_label: destinationLabel,
-    destination_missing: destinationMissing,
-    // destination_needs_reauth is filled in by the popup — the SW
-    // cannot reliably read FS Access permission state cross-context.
-    destination_needs_reauth: false,
-    captures_count: capturesCount,
-    session: state.last_session,
-    last_sync_at: state.last_sync_at,
-    last_sync_error: state.last_sync_error,
+    brand_color: adapter.brand_color ?? null,
+    session,
+    miyo_total: miyoFolder?.count ?? null,
+    miyo_folder_path: miyoFolder?.folder_path ?? null,
+    new_available: null,
+    new_available_saturated: false,
   };
 }
 
 async function buildSnapshot(): Promise<PopupSnapshot> {
-  const sites = await Promise.all(ADAPTERS.map(buildSiteRow));
-  return {
+  const client = await getMiyo(true);
+  const miyoFolders = new Map<SiteId, AppFolderInfo>();
+
+  if (client) {
+    await Promise.all(
+      ADAPTERS.map(async (a) => {
+        try {
+          const info = await client.ensureAppFolder(a.id, a.label);
+          miyoFolders.set(a.id, info);
+        } catch {
+          // Tolerate per-source failure — that row shows no Miyo data.
+        }
+      })
+    );
+  }
+
+  const [sites, pendingRun] = await Promise.all([
+    Promise.all(ADAPTERS.map((a) => buildRow(a, miyoFolders.get(a.id) ?? null))),
+    readPendingRun(),
+  ]);
+
+  const snapshot: PopupSnapshot = {
+    miyo_connected: client !== null,
     sites,
-    active_sync: null,
+    pending_run: pendingRun,
   };
+
+  void chrome.storage.local.set({ last_snapshot: snapshot });
+  return snapshot;
 }
 
-async function probeAll(): Promise<void> {
-  // Only probe enabled sites — no need to hit network for sites the
-  // user hasn't opted into.
+// Per-site delta probe. Up to MAX_PROBE_PAGES rate-limited list-page
+// calls per site (slow — that's why this is split off from buildSnapshot).
+// Returns an empty record if Miyo isn't connected.
+async function probeDeltas(): Promise<
+  Record<SiteId, { count: number; saturated: boolean }>
+> {
+  const client = await getMiyo();
+  if (!client) return {};
+  const out: Record<SiteId, { count: number; saturated: boolean }> = {};
   await Promise.all(
     ADAPTERS.map(async (a) => {
-      const config = await getSiteConfig(a.id);
-      if (!config.enabled) return;
       try {
         const session = await a.probeSession();
-        await patchSiteState(a.id, { last_session: session, last_probe_at: Date.now() });
+        if (!session.signedIn) return;
+        const folder = await client.ensureAppFolder(a.id, a.label);
+        const store = new MiyoStore(client, a.id, folder.folder_name);
+        const probe = await probeStoreDelta(a, store);
+        out[a.id] = { count: probe.count, saturated: probe.saturated };
       } catch {
-        await patchSiteState(a.id, {
-          last_session: { signedIn: false, email: null },
-          last_probe_at: Date.now(),
-        });
+        // best-effort; missing entries stay null in the popup
       }
     })
   );
+  return out;
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Toolbar badge — capture-in-progress indicator
+// ──────────────────────────────────────────────────────────────────
+
+const BADGE_FRAMES = ['•', '• •', '• • •'];
+const BADGE_FRAME_MS = 450;
+const BADGE_COLOR = '#0f766e';
+
+let badgeAnimationTimer: ReturnType<typeof setInterval> | null = null;
+
+function showBadge(label: string): void {
+  void chrome.action.setBadgeBackgroundColor({ color: BADGE_COLOR });
+  void chrome.action.setTitle({ title: `Miyo Capture — capturing ${label}…` });
+  let frame = 0;
+  void chrome.action.setBadgeText({ text: BADGE_FRAMES[frame]! });
+  if (badgeAnimationTimer !== null) clearInterval(badgeAnimationTimer);
+  badgeAnimationTimer = setInterval(() => {
+    frame = (frame + 1) % BADGE_FRAMES.length;
+    void chrome.action.setBadgeText({ text: BADGE_FRAMES[frame]! });
+  }, BADGE_FRAME_MS);
+}
+
+function clearBadge(): void {
+  if (badgeAnimationTimer !== null) {
+    clearInterval(badgeAnimationTimer);
+    badgeAnimationTimer = null;
+  }
+  void chrome.action.setBadgeText({ text: '' });
+  void chrome.action.setTitle({ title: 'Miyo Capture' });
+}
+
+// Defensive: on SW wake-up, runningRun is null but the badge state
+// is owned by the browser and may have survived a previous instance's
+// death. Clear it once at module load.
+clearBadge();
+
+// ──────────────────────────────────────────────────────────────────
+// Capture run dispatch
+// ──────────────────────────────────────────────────────────────────
+
+interface RunningRun {
+  siteId: SiteId;
+  mode: CaptureMode;
+  subscribers: Set<chrome.runtime.Port>;
+  progress: { phase: 'listing' | 'fetching'; completed: number; total: number | null };
+  cancelRequested: boolean;
+}
+
+let runningRun: RunningRun | null = null;
+
+function broadcast(entry: RunningRun, msg: unknown): void {
+  for (const port of entry.subscribers) {
+    try {
+      port.postMessage(msg);
+    } catch {
+      // Subscriber gone; cleanup happens via onDisconnect.
+    }
+  }
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     try {
-      if (msg?.type === 'open' || msg?.type === 'probe') {
-        await probeAll();
+      if (msg?.type === 'snapshot') {
         sendResponse(await buildSnapshot());
         return;
       }
-      if (msg?.type === 'snapshot') {
-        sendResponse(await buildSnapshot());
+      if (msg?.type === 'deltas') {
+        sendResponse(await probeDeltas());
         return;
       }
       sendResponse({ error: 'unknown_message' });
@@ -131,45 +298,285 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== 'sync') return;
+  if (port.name !== 'capture') return;
 
-  let safePost = (msg: unknown): void => {
+  const safePost = (msg: unknown): void => {
     try {
       port.postMessage(msg);
     } catch {
-      // Popup closed — work continues silently to completion.
+      // already gone
     }
   };
+
   port.onDisconnect.addListener(() => {
-    safePost = () => {};
+    if (runningRun) runningRun.subscribers.delete(port);
   });
 
   port.onMessage.addListener((msg) => {
-    if (msg?.type === 'start' && typeof msg.site === 'string') {
-      const adapter = getAdapter(msg.site);
+    if (typeof msg !== 'object' || msg === null) return;
+    const m = msg as {
+      type?: string;
+      site?: string;
+      mode?: CaptureMode;
+      range?: TimeRange;
+    };
+
+    if (m.type === 'cancel' && typeof m.site === 'string') {
+      if (runningRun && runningRun.siteId === m.site) {
+        runningRun.cancelRequested = true;
+      }
+      return;
+    }
+
+    if (m.type === 'discard') {
+      void (async () => {
+        if (runningRun?.mode === 'local') {
+          runningRun.cancelRequested = true;
+        }
+        const run = await readPendingRun();
+        if (run) {
+          await clearItems(run.siteId);
+          await clearPendingRun();
+        }
+      })();
+      return;
+    }
+
+    if (m.type === 'attach' && typeof m.site === 'string') {
+      if (runningRun && runningRun.siteId === m.site) {
+        runningRun.subscribers.add(port);
+        safePost({
+          type: 'progress',
+          site: m.site,
+          phase: runningRun.progress.phase,
+          completed: runningRun.progress.completed,
+          total: runningRun.progress.total,
+        });
+      } else {
+        safePost({ type: 'not_running', site: m.site });
+      }
+      return;
+    }
+
+    const isStart = m.type === 'start' && typeof m.site === 'string';
+    const isResume = m.type === 'resume';
+    if (!isStart && !isResume) return;
+
+    void (async () => {
+      let siteId: SiteId;
+      let mode: CaptureMode;
+      let range: TimeRange | null;
+
+      if (isResume) {
+        const run = await readPendingRun();
+        if (!run) {
+          safePost({
+            type: 'done',
+            site: '',
+            result: { kind: 'aborted', reason: 'no_pending_run' },
+          });
+          return;
+        }
+        siteId = run.siteId;
+        mode = run.mode;
+        range = run.range;
+        await writePendingRun({ ...run, status: 'capturing' });
+      } else {
+        if (m.mode !== 'local' && m.mode !== 'miyo') return;
+        siteId = m.site as SiteId;
+        mode = m.mode;
+        range = m.range ?? null;
+      }
+
+      const adapter = getAdapter(siteId);
       if (!adapter) {
         safePost({
           type: 'done',
-          site: msg.site,
+          site: siteId,
           result: { kind: 'aborted', reason: 'unknown_site' },
         });
         return;
       }
-      void (async () => {
-        const result = await runSync(adapter, {
-          onProgress: ({ completed, total }) => {
-            safePost({ type: 'progress', site: adapter.id, completed, total });
+
+      // Reattach if this site is already running.
+      if (runningRun && runningRun.siteId === adapter.id) {
+        runningRun.subscribers.add(port);
+        safePost({
+          type: 'progress',
+          site: adapter.id,
+          phase: runningRun.progress.phase,
+          completed: runningRun.progress.completed,
+          total: runningRun.progress.total,
+        });
+        return;
+      }
+
+      if (runningRun) {
+        safePost({
+          type: 'done',
+          site: adapter.id,
+          result: { kind: 'aborted', reason: 'busy' },
+        });
+        return;
+      }
+
+      if (!isResume) {
+        const existing = await readPendingRun();
+        if (existing) {
+          safePost({
+            type: 'done',
+            site: adapter.id,
+            result: { kind: 'aborted', reason: 'pending_run_exists' },
+          });
+          return;
+        }
+        const usedRange: TimeRange = range ?? DEFAULT_TIME_RANGE;
+        await writePendingRun({
+          siteId: adapter.id,
+          mode,
+          range: usedRange,
+          started_at: Date.now(),
+          status: 'capturing',
+          written: 0,
+          errors: 0,
+          cursor: null,
+          newest_seen: null,
+        });
+        range = usedRange;
+      }
+
+      const resumeFrom = isResume ? (await readPendingRun())?.written ?? 0 : 0;
+      const entry: RunningRun = {
+        siteId: adapter.id,
+        mode,
+        subscribers: new Set([port]),
+        progress: {
+          phase: 'listing',
+          completed: resumeFrom,
+          total: null,
+        },
+        cancelRequested: false,
+      };
+      runningRun = entry;
+      showBadge(adapter.label);
+
+      try {
+        const callbacks = {
+          onProgress: ({
+            phase,
+            completed,
+            total,
+            note,
+          }: {
+            phase: 'listing' | 'fetching';
+            completed: number;
+            total: number | null;
+            note?: string;
+          }) => {
+            entry.progress = { phase, completed, total };
+            broadcast(entry, {
+              type: 'progress',
+              site: adapter.id,
+              phase,
+              completed,
+              total,
+              note,
+            });
+          },
+          isCancelled: () => entry.cancelRequested,
+        };
+
+        const usedRange: TimeRange = range ?? DEFAULT_TIME_RANGE;
+        const { sinceMs, untilMs } = rangeToWindow(usedRange);
+
+        // Watermark only applies to Miyo mode with no lower range
+        // bound — it's the "last successful sync's high water" used
+        // to stop early on incremental syncs. Local mode wipes its
+        // store after each zip, so the concept doesn't apply.
+        const watermark =
+          mode === 'miyo' && sinceMs === null
+            ? await readMiyoWatermark(adapter.id)
+            : null;
+
+        let store: Store;
+        let result;
+        if (mode === 'miyo') {
+          const client = await getMiyo();
+          if (!client) {
+            result = { kind: 'aborted' as const, reason: 'miyo_unavailable' };
+          } else {
+            try {
+              const folder = await client.ensureAppFolder(adapter.id, adapter.label);
+              store = new MiyoStore(client, adapter.id, folder.folder_name);
+            } catch (err) {
+              const reason =
+                err instanceof MiyoUnavailableError
+                  ? 'miyo_unavailable'
+                  : err instanceof Error
+                    ? err.message
+                    : String(err);
+              result = { kind: 'aborted' as const, reason };
+              store = null as unknown as Store;
+            }
+            if (!result) {
+              result = await captureToStore(
+                adapter,
+                store!,
+                'miyo',
+                sinceMs,
+                untilMs,
+                watermark,
+                callbacks
+              );
+            }
+          }
+        } else {
+          store = new IdbStore(adapter.id);
+          result = await captureToStore(
+            adapter,
+            store,
+            'local',
+            sinceMs,
+            untilMs,
+            null,
+            callbacks
+          );
+        }
+
+        // 'ready' is the popup's signal to zip+clear (local) or just
+        // banner+clear (Miyo). User-Stop wipes everything; other
+        // aborts leave the record paused so the user can Resume.
+        if (result.kind === 'completed') {
+          if (mode === 'miyo') {
+            const run = await readPendingRun();
+            if (run?.newest_seen) {
+              await writeMiyoWatermark(adapter.id, run.newest_seen);
+            }
+          }
+          await updatePendingRun({
+            status: 'ready',
+            written: result.written,
+            errors: result.errors,
+          });
+        } else if (result.reason === 'cancelled') {
+          if (mode === 'local') await clearItems(adapter.id);
+          await clearPendingRun();
+        }
+
+        broadcast(entry, { type: 'done', site: adapter.id, result });
+      } catch (err) {
+        broadcast(entry, {
+          type: 'done',
+          site: adapter.id,
+          result: {
+            kind: 'aborted',
+            reason: err instanceof Error ? err.message : String(err),
           },
         });
-        safePost({ type: 'done', site: adapter.id, result });
-      })();
-    }
+      } finally {
+        if (runningRun === entry) runningRun = null;
+        clearBadge();
+      }
+    })();
   });
-});
-
-chrome.runtime.onInstalled.addListener(() => {
-  void probeAll();
-});
-chrome.runtime.onStartup.addListener(() => {
-  void probeAll();
 });

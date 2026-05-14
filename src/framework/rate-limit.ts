@@ -8,6 +8,15 @@
 // All adapters route their network calls through `paced(site, fn)` —
 // they cannot opt out. This is structural: the per-site pacer is the
 // only way the framework keeps every adapter honest.
+//
+// Pacer state is mirrored to chrome.storage.session so that a service-
+// worker death (idle, crash, browser internals) does not reset the
+// backoff multiplier. Without this, a 429 that escalated backoff to
+// 30s would be forgotten on the next SW wake — the next call would
+// fire immediately and re-hit the rate limit. We use session storage
+// (not local) because pacer state is meaningful only within a single
+// browser session; once the browser fully restarts, a fresh start
+// from FLOOR_MS is fine.
 
 const FLOOR_MS = 1500;
 const BACKOFF_MAX_MS = 60_000;
@@ -20,14 +29,41 @@ interface PacerState {
 }
 
 const pacers = new Map<string, PacerState>();
+const loadedSites = new Set<string>();
 
-function getPacer(site: string): PacerState {
+function pacerStorageKey(site: string): string {
+  return `pacer:${site}`;
+}
+
+async function loadPacer(site: string): Promise<PacerState> {
+  if (!loadedSites.has(site)) {
+    const key = pacerStorageKey(site);
+    try {
+      const obj = await chrome.storage.session.get(key);
+      const stored = obj[key] as PacerState | undefined;
+      if (stored && typeof stored.earliest_at === 'number' && typeof stored.backoff === 'number') {
+        pacers.set(site, { earliest_at: stored.earliest_at, backoff: stored.backoff });
+      }
+    } catch {
+      // session storage unavailable (e.g., in tests). Fall back to
+      // ephemeral state — same behavior as before this change.
+    }
+    loadedSites.add(site);
+  }
   let p = pacers.get(site);
   if (!p) {
     p = { earliest_at: 0, backoff: 1 };
     pacers.set(site, p);
   }
   return p;
+}
+
+async function savePacer(site: string, state: PacerState): Promise<void> {
+  try {
+    await chrome.storage.session.set({ [pacerStorageKey(site)]: state });
+  } catch {
+    // Same fallback as loadPacer — pacer continues to work in memory.
+  }
 }
 
 function sleep(ms: number): Promise<void> {
@@ -55,7 +91,7 @@ export class FatalError extends Error {
 }
 
 export async function paced<T>(site: string, fn: () => Promise<T>): Promise<T> {
-  const pacer = getPacer(site);
+  const pacer = await loadPacer(site);
   const wait = pacer.earliest_at - Date.now();
   if (wait > 0) await sleep(wait);
 
@@ -63,6 +99,7 @@ export async function paced<T>(site: string, fn: () => Promise<T>): Promise<T> {
     const result = await fn();
     pacer.backoff = 1;
     pacer.earliest_at = Date.now() + FLOOR_MS;
+    await savePacer(site, pacer);
     return result;
   } catch (err) {
     // On a retryable error, advance the floor by an exponentially
@@ -75,6 +112,7 @@ export async function paced<T>(site: string, fn: () => Promise<T>): Promise<T> {
     } else {
       pacer.earliest_at = Date.now() + FLOOR_MS;
     }
+    await savePacer(site, pacer);
     throw err;
   }
 }

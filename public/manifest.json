@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Miyo Capture",
   "short_name": "Miyo Capture",
-  "version": "0.1.0",
-  "description": "Capture AI chats (ChatGPT, Claude) as local markdown in a folder you choose. Yours, on your machine.",
+  "version": "0.3.0",
+  "description": "Capture AI chats (ChatGPT, Claude) and send them to Miyo, or export as a ZIP. Yours, on your machine.",
   "icons": {
     "16": "icons/icon-16.png",
     "48": "icons/icon-48.png",
@@ -22,11 +22,12 @@
     "service_worker": "background.js",
     "type": "module"
   },
-  "permissions": ["storage", "downloads"],
+  "permissions": ["storage"],
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://*.chatgpt.com/*",
     "https://claude.ai/*",
-    "https://*.claude.ai/*"
+    "https://*.claude.ai/*",
+    "http://127.0.0.1:8742/*"
   ]
 }
