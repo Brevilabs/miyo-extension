@@ -129,15 +129,6 @@ export async function captureToStore(
   let errors = existing?.errors ?? 0;
   let listCursor: string | null = existing?.cursor ?? null;
   let unflushed = 0;
-  // Running count of in-range items seen across all pages so the
-  // popup can show "Checked N conversations…" while filterMissing
-  // walks page after page. Important on unbounded ("all") syncs
-  // where most pages may have nothing new.
-  let scanned = 0;
-  // The oldest updated_at the loop has reached so far. Surfaced to
-  // the popup as "back to <date>" so the user can see the depth of
-  // the walk — especially useful on long unbounded syncs.
-  let oldestSeen: string | null = null;
   // The most recent title we successfully captured. Surfaced as a
   // detail line so the user sees what's being saved, not just a
   // count.
@@ -204,11 +195,6 @@ export async function captureToStore(
     // "Looking for new conversations…" for an entire library walk.
     // On the first page with new items, switch to "Found N new,
     // fetching…" so the user knows fetching is about to start.
-    scanned += inRange.length;
-    if (inRange.length > 0) {
-      const pageOldest = inRange[inRange.length - 1]!.updated_at;
-      if (oldestSeen === null || pageOldest < oldestSeen) oldestSeen = pageOldest;
-    }
     if (!firstPageProcessed && missing.length > 0) {
       callbacks.onProgress({
         phase: 'listing',
@@ -216,14 +202,21 @@ export async function captureToStore(
         total: null,
         note: `Found ${missing.length} new, fetching…`,
       });
-    } else {
+    } else if (inRange.length > 0) {
+      // Adapters return items newest-first, so the first item is the
+      // newest in this page and the last is the oldest. Surfacing the
+      // window lets the user see exactly which conversations are
+      // being diffed right now, and the window naturally advances
+      // backwards in time as we paginate.
       const target = mode === 'miyo' ? 'Miyo' : 'your local cache';
-      const depth = oldestSeen ? ` · back to ${formatDate(oldestSeen)}` : '';
+      const newest = formatDate(inRange[0]!.updated_at);
+      const oldest = formatDate(inRange[inRange.length - 1]!.updated_at);
+      const window = newest === oldest ? newest : `${newest} → ${oldest}`;
       callbacks.onProgress({
         phase: 'listing',
         completed: 0,
         total: null,
-        note: `Checked ${scanned.toLocaleString()} against ${target}${depth}…`,
+        note: `Checking ${window} against ${target}…`,
       });
     }
     firstPageProcessed = true;
