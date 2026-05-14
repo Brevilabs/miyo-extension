@@ -1,68 +1,162 @@
 // Popup UI.
 //
-// Vanilla DOM, no framework — keeps the extension lean and
-// review-friendly.
+// Two modes, mutually exclusive:
 //
-// One screen, one concept: the list of supported sites. Each site is
-// either enabled (with a destination, a capture count, and a sync
-// button), paused, or not-yet-enabled. The enable flow opens a modal
-// that asks for a destination folder (Chromium) or confirms the
-// downloads-folder default (Firefox/Safari).
+//   • Miyo connected: per-site row shows Miyo's count + the delta
+//     available on the site. One primary action: [Send to Miyo].
+//     Miyo is the source of truth; no local cache is used.
 //
-// The popup writes config directly to chrome.storage.local and
-// IndexedDB via the destinations module — the background service
-// worker mediates only sync runs.
+//   • Miyo not connected (or not installed): per-site row shows the
+//     local cache size. Two actions: [Capture] (refresh the cache)
+//     and [Export ZIP] (download whatever's in the cache).
+//
+// Vanilla DOM. No framework — keeps the extension lean.
 
-import {
-  getSiteConfig,
-  setSiteConfig,
-  setFolderHandle,
-  requestPermission,
-  hasPermission,
-  getFolderHandle,
-  supportsFolderPicker,
-  defaultDownloadsSubpath,
-} from '../framework/destinations.js';
-import { META_FILENAME, parseMeta } from '../framework/meta.js';
+import { getCache } from '../framework/cache.js';
+import { buildZip } from '../framework/zip.js';
+import { DEFAULT_TIME_RANGE } from '../framework/types.js';
 import type {
   PopupSnapshot,
   SiteId,
-  SiteRowSnapshot,
+  SiteRow,
+  TimeRange,
+  TimeRangePreset,
 } from '../framework/types.js';
 
 // ──────────────────────────────────────────────────────────────────
-// Types for messages from background
+// Types & state
 // ──────────────────────────────────────────────────────────────────
 
-type SyncDone = {
+type CaptureDone = {
   type: 'done';
   site: SiteId;
   result:
-    | { kind: 'completed'; written: number; errors: number }
-    | { kind: 'paused'; written: number; reason: string }
+    | {
+        kind: 'completed';
+        mode: 'zip' | 'miyo';
+        written: number;
+        errors: number;
+        saturated?: boolean;
+      }
     | { kind: 'aborted'; reason: string };
 };
-
-// ──────────────────────────────────────────────────────────────────
-// UI state
-// ──────────────────────────────────────────────────────────────────
 
 interface UIState {
   snapshot: PopupSnapshot | null;
   initializing: boolean;
-  syncing: SiteId | null;
-  syncProgress: { completed: number; total: number | null } | null;
-  enableModal: { siteId: SiteId; label: string; error: string | null } | null;
+  capturing: SiteId | null;
+  captureProgress: {
+    phase: 'listing' | 'fetching';
+    completed: number;
+    total: number | null;
+  } | null;
+  capturePort: chrome.runtime.Port | null;
   banner: { kind: 'info' | 'error'; text: string } | null;
+  // Per-site capture range. Loaded from chrome.storage.local on init,
+  // updated as the user changes the picker. Sent with the start
+  // message so the background applies it.
+  ranges: Record<SiteId, TimeRange>;
 }
 
 const ui: UIState = {
   snapshot: null,
   initializing: true,
-  syncing: null,
-  syncProgress: null,
-  enableModal: null,
+  capturing: null,
+  captureProgress: null,
+  capturePort: null,
   banner: null,
+  ranges: {},
+};
+
+const RANGES_STORAGE_KEY = 'time_ranges';
+
+function toISODateLocal(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function todayISODate(): string {
+  return toISODateLocal(new Date());
+}
+
+// 7 days ago, local timezone.
+function defaultSinceDate(): string {
+  return toISODateLocal(new Date(Date.now() - 7 * 86_400_000));
+}
+
+// Sanitize: tolerate older shapes (custom without untilISODate) and
+// reject malformed entries silently. Old entries get untilISODate
+// filled with today so the window includes everything up to now.
+async function loadRanges(): Promise<Record<SiteId, TimeRange>> {
+  try {
+    const obj = await chrome.storage.local.get(RANGES_STORAGE_KEY);
+    const raw = (obj[RANGES_STORAGE_KEY] as Record<SiteId, unknown> | undefined) ?? {};
+    const out: Record<SiteId, TimeRange> = {};
+    for (const [k, v] of Object.entries(raw)) {
+      if (typeof v !== 'object' || v === null) continue;
+      const r = v as { kind?: string; preset?: string; sinceISODate?: string; untilISODate?: string };
+      if (r.kind === 'preset' && r.preset) {
+        const presets: TimeRangePreset[] = ['24h', '7d', '30d', '90d', 'all'];
+        if ((presets as string[]).includes(r.preset)) {
+          out[k] = { kind: 'preset', preset: r.preset as TimeRangePreset };
+        }
+      } else if (
+        r.kind === 'custom' &&
+        typeof r.sinceISODate === 'string' &&
+        /^\d{4}-\d{2}-\d{2}$/.test(r.sinceISODate)
+      ) {
+        const untilOk =
+          typeof r.untilISODate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(r.untilISODate);
+        out[k] = {
+          kind: 'custom',
+          sinceISODate: r.sinceISODate,
+          untilISODate: untilOk ? (r.untilISODate as string) : todayISODate(),
+        };
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function saveRanges(): void {
+  void chrome.storage.local.set({ [RANGES_STORAGE_KEY]: ui.ranges });
+}
+
+function getRange(siteId: SiteId): TimeRange {
+  return ui.ranges[siteId] ?? DEFAULT_TIME_RANGE;
+}
+
+function describeRange(range: TimeRange): string {
+  if (range.kind === 'custom') {
+    const sameAsToday = range.untilISODate === todayISODate();
+    return sameAsToday
+      ? `since ${range.sinceISODate}`
+      : `${range.sinceISODate} to ${range.untilISODate}`;
+  }
+  switch (range.preset) {
+    case '24h':
+      return 'the last 24 hours';
+    case '7d':
+      return 'the last 7 days';
+    case '30d':
+      return 'the last 30 days';
+    case '90d':
+      return 'the last 90 days';
+    case 'all':
+      return 'all available history';
+  }
+}
+
+const PRESET_LABELS: Record<TimeRangePreset, string> = {
+  '24h': 'Last 24 hours',
+  '7d': 'Last 7 days',
+  '30d': 'Last 30 days',
+  '90d': 'Last 90 days',
+  all: 'All available',
 };
 
 const root = document.getElementById('root')!;
@@ -85,44 +179,14 @@ function escape(s: string): string {
   );
 }
 
-function fmtTime(ts: number | null): string {
-  if (!ts) return 'never';
-  const diff = Date.now() - ts;
-  if (diff < 60_000) return 'just now';
-  const min = Math.floor(diff / 60_000);
-  if (min < 60) return `${min}m ago`;
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}h ago`;
-  return new Date(ts).toLocaleDateString();
-}
-
-// Browser global type bridge for showDirectoryPicker. The popup runs
-// in an extension page context which has `window`; the global cast
-// keeps this file portable.
-interface DirectoryPickerOptions {
-  mode?: 'read' | 'readwrite';
-  id?: string;
-  startIn?: 'desktop' | 'documents' | 'downloads' | 'music' | 'pictures' | 'videos';
-}
-type ShowDirectoryPicker = (opts?: DirectoryPickerOptions) => Promise<FileSystemDirectoryHandle>;
-
-// ──────────────────────────────────────────────────────────────────
-// Rendering
-// ──────────────────────────────────────────────────────────────────
-
-// Each site gets a small brand accent (left rail + logo tint) — same
-// palette the desktop SourcesTab uses, so the two surfaces feel like one
-// product. Unknown sites fall back to the teal accent.
 const SITE_BRAND: Record<string, { color: string; soft: string; initial: string }> = {
   chatgpt: { color: '#10a37f', soft: '#e0f5ee', initial: 'C' },
-  claude: { color: '#c66439', soft: '#f8e7dc', initial: 'A' },
   claude_ai: { color: '#c66439', soft: '#f8e7dc', initial: 'A' },
 };
 
 function brandFor(siteId: string, label: string): { color: string; soft: string; initial: string } {
-  const id = siteId.toLowerCase();
   return (
-    SITE_BRAND[id] ?? {
+    SITE_BRAND[siteId.toLowerCase()] ?? {
       color: '#0f766e',
       soft: '#d9f1ef',
       initial: label.charAt(0).toUpperCase() || '·',
@@ -130,39 +194,53 @@ function brandFor(siteId: string, label: string): { color: string; soft: string;
   );
 }
 
-function siteStatus(s: SiteRowSnapshot, isSyncing: boolean): { cls: string; text: string } {
-  if (isSyncing) return { cls: 'status-syncing', text: 'Syncing' };
-  if (!s.enabled) return { cls: 'status-off', text: 'Off' };
-  if (s.destination_missing) return { cls: 'status-warn', text: 'Reconnect' };
-  if (s.destination_needs_reauth) return { cls: 'status-warn', text: 'Access' };
-  if (s.paused) return { cls: 'status-paused', text: 'Paused' };
-  if (s.last_sync_error && s.last_sync_error !== 'permission_revoked')
-    return { cls: 'status-error', text: 'Error' };
+function findSite(siteId: SiteId): SiteRow | null {
+  return ui.snapshot?.sites.find((s) => s.id === siteId) ?? null;
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Rendering
+// ──────────────────────────────────────────────────────────────────
+
+const REFRESH_ICON = `<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 8a6 6 0 1 1-1.76-4.24"/><path d="M14 2.5v3.5h-3.5"/></svg>`;
+
+const DOWNLOAD_ICON = `<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2v8.5"/><path d="M4.5 7.5L8 11l3.5-3.5"/><path d="M3 13.5h10"/></svg>`;
+
+const MIYO_INSTALL_URL = 'https://www.miyo.md/';
+
+function siteStatus(s: SiteRow, isCapturing: boolean): { cls: string; text: string } {
+  if (isCapturing) return { cls: 'status-syncing', text: 'Capturing' };
+  if (!s.session) return { cls: 'status-off', text: 'Checking…' };
+  if (!s.session.signedIn) return { cls: 'status-warn', text: 'Sign in' };
   return { cls: 'status-ready', text: 'Ready' };
 }
 
-function renderSiteRow(s: SiteRowSnapshot): string {
-  const isSyncing = ui.syncing === s.id;
-  const anyBusy = ui.syncing !== null;
+function renderProgress(): string {
+  if (!ui.captureProgress) return '';
+  const { phase, completed, total } = ui.captureProgress;
+  let text: string;
+  let determinate = false;
+  if (phase === 'listing') {
+    text = completed > 0 ? `Scanning… ${completed} found` : 'Scanning…';
+  } else {
+    text = total ? `${completed} of ${total}` : `${completed} captured`;
+    determinate = total !== null && total > 0;
+  }
+  const bar = determinate
+    ? `<div class="progress-bar-container"><div class="progress-bar" style="width:${Math.min(100, Math.round((completed / total!) * 100))}%"></div></div>`
+    : `<div class="progress-bar-container"><div class="progress-bar progress-bar-indeterminate"></div></div>`;
+  return `<div class="site-progress">${bar}<span class="site-progress-text">${escape(text)}</span></div>`;
+}
+
+function renderSiteRow(s: SiteRow): string {
+  const miyoMode = ui.snapshot?.miyo_connected === true;
+  const isCapturing = ui.capturing === s.id;
+  const anyBusy = ui.capturing !== null;
   const brand = brandFor(s.id, s.label);
-  const status = siteStatus(s, isSyncing);
+  const status = siteStatus(s, isCapturing);
   const cardStyle = `--svc-color:${brand.color};--svc-color-soft:${brand.soft};`;
 
-  if (!s.enabled) {
-    return `
-      <div class="site-card" style="${cardStyle}">
-        <div class="site-card-head">
-          <div class="site-logo">${escape(brand.initial)}</div>
-          <div class="site-title">
-            <div class="site-name">${escape(s.label)}</div>
-            <div class="site-blurb">Save your ${escape(s.label)} conversations as local markdown.</div>
-          </div>
-          <button class="primary-button" data-action="enable" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Enable →</button>
-        </div>
-      </div>`;
-  }
-
-  // ── Enabled ─────────────────────────────────────────────────────
+  // Account line.
   const accountLine = s.session?.signedIn
     ? s.session.email
       ? `<span class="site-account">${escape(s.session.email)}</span>`
@@ -171,71 +249,86 @@ function renderSiteRow(s: SiteRowSnapshot): string {
       ? `<span class="site-account">not signed in</span>`
       : '';
 
-  const destLine = s.destination_missing
-    ? `<div class="site-warn">Folder no longer available — reconnect to resume.</div>`
-    : s.destination_label
-      ? `<div class="site-meta-dest"><span class="site-meta-arrow">→</span><span class="site-path">${escape(s.destination_label)}</span></div>`
-      : `<div class="site-meta-dest"><span class="site-meta-arrow">→</span><span class="site-path">no destination</span></div>`;
-
-  const countPart =
-    s.captures_count !== null
-      ? `<strong>${s.captures_count}</strong> capture${s.captures_count === 1 ? '' : 's'}`
-      : null;
-  const whenPart = `<span class="site-when">last sync ${escape(fmtTime(s.last_sync_at))}</span>`;
-  const countsLine = `<div class="site-counts">${countPart ? `${countPart} · ${whenPart}` : whenPart}</div>`;
-
-  let noteLine = '';
-  if (s.destination_needs_reauth) {
-    noteLine = `<div class="site-warn">Needs folder access — click Sync to grant.</div>`;
-  } else if (s.session && !s.session.signedIn) {
-    noteLine = `<div class="site-warn">Open ${escape(s.label)} in a tab and sign in.</div>`;
-  } else if (s.last_sync_error && s.last_sync_error !== 'permission_revoked') {
-    noteLine = `<div class="site-err">${escape(explainAbort(s.last_sync_error))}</div>`;
-  }
-
-  let progress = '';
-  if (isSyncing) {
-    const text = ui.syncProgress
-      ? ui.syncProgress.total
-        ? `${ui.syncProgress.completed} of ${ui.syncProgress.total}`
-        : `${ui.syncProgress.completed} captured`
-      : 'Starting…';
-    const bar =
-      ui.syncProgress && ui.syncProgress.total
-        ? `<div class="progress-bar-container"><div class="progress-bar" style="width:${Math.min(100, Math.round((ui.syncProgress.completed / ui.syncProgress.total) * 100))}%"></div></div>`
-        : `<div class="progress-bar-container"><div class="progress-bar progress-bar-indeterminate"></div></div>`;
-    progress = `<div class="site-progress">${bar}<span class="site-progress-text">${escape(text)}</span></div>`;
-  }
-
-  // Actions row
-  const actions: string[] = [];
-  if (s.destination_missing) {
-    actions.push(
-      `<button class="primary-button" data-action="reconnect" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Reconnect</button>`
-    );
-  } else if (s.paused) {
-    actions.push(
-      `<button class="primary-button" data-action="resume" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Resume</button>`
-    );
+  // Body line: differs by mode.
+  let bodyLine = '';
+  if (miyoMode) {
+    const total = s.miyo_total;
+    const newCount = s.new_available;
+    const totalStr =
+      total !== null
+        ? `<strong>${total.toLocaleString()}</strong> in Miyo`
+        : '<span class="site-counts">checking Miyo…</span>';
+    let newStr = '';
+    if (newCount !== null && newCount > 0) {
+      const display = `${newCount}${s.new_available_saturated ? '+' : ''}`;
+      newStr = ` · <span class="new-items-badge">${display} new available</span>`;
+    } else if (newCount === 0) {
+      newStr = ` · <span class="all-captured-badge">✓ all captured</span>`;
+    }
+    bodyLine = `<div class="site-counts">${totalStr}${newStr}</div>`;
   } else {
-    const syncDisabled = anyBusy && !isSyncing;
+    const cached = s.cached_count;
+    const cachedStr =
+      cached !== null && cached > 0
+        ? `<strong>${cached}</strong> cached locally`
+        : 'no captures yet';
+    bodyLine = `<div class="site-counts">${cachedStr}</div>`;
+  }
+
+  // Actions.
+  const actions: string[] = [];
+  if (!s.session?.signedIn) {
     actions.push(
-      `<button class="primary-button" data-action="sync" data-site="${escape(s.id)}" ${syncDisabled ? 'disabled' : ''}>${isSyncing ? 'Syncing…' : 'Sync now'}</button>`
+      `<button class="primary-button" data-action="open-site" data-site="${escape(s.id)}">Sign in to ${escape(s.label)} →</button>`
     );
-    if (!isSyncing) {
+  } else if (miyoMode) {
+    const hasNew = (s.new_available ?? 0) > 0;
+    const label = isCapturing
+      ? 'Sending…'
+      : hasNew
+        ? `Send to Miyo (${s.new_available}${s.new_available_saturated ? '+' : ''})`
+        : `${REFRESH_ICON}<span>Check again</span>`;
+    actions.push(
+      `<button class="primary-button refresh-button" data-action="capture-miyo" data-site="${escape(s.id)}" ${anyBusy && !isCapturing ? 'disabled' : ''}>${label}</button>`
+    );
+    if (isCapturing) {
       actions.push(
-        `<button class="link-button" data-action="pause" data-site="${escape(s.id)}">Pause</button>`
+        `<button class="link-button link-button-danger" data-action="cancel" data-site="${escape(s.id)}">Stop</button>`
+      );
+    }
+  } else {
+    const captureLabel = isCapturing
+      ? 'Capturing…'
+      : `${DOWNLOAD_ICON}<span>Capture Recent Conversations</span>`;
+    actions.push(
+      `<button class="primary-button refresh-button" data-action="capture-zip" data-site="${escape(s.id)}" ${anyBusy && !isCapturing ? 'disabled' : ''}>${captureLabel}</button>`
+    );
+    if (isCapturing) {
+      actions.push(
+        `<button class="link-button link-button-danger" data-action="cancel" data-site="${escape(s.id)}">Stop</button>`
+      );
+    } else if ((s.cached_count ?? 0) > 0) {
+      actions.push(
+        `<button class="link-button" data-action="export-zip" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Export ZIP</button>`
       );
     }
   }
-  if (!isSyncing) {
-    actions.push(
-      `<button class="link-button" data-action="change-destination" data-site="${escape(s.id)}">Change folder</button>`
-    );
-    actions.push(
-      `<button class="link-button link-button-danger" data-action="disable" data-site="${escape(s.id)}">Disable</button>`
-    );
-  }
+
+  const progress = isCapturing ? renderProgress() : '';
+
+  // Range picker: zip mode only, only when signed in and not
+  // currently capturing. Miyo mode does its own incremental diff so
+  // no range selector is needed there.
+  const showPicker = !miyoMode && s.session?.signedIn && !isCapturing;
+  const range = getRange(s.id);
+  const rangePicker = showPicker ? renderRangePicker(s.id, range) : '';
+
+  // Hint about the safety cap. Now that the user controls the range,
+  // the cap is explained as a per-run safety, not a fixed limit.
+  const zipHint =
+    !miyoMode && s.session?.signedIn
+      ? `<div class="site-hint">Newest first within your range, up to 200 conversations per run.</div>`
+      : '';
 
   return `
     <div class="site-card" style="${cardStyle}">
@@ -246,82 +339,72 @@ function renderSiteRow(s: SiteRowSnapshot): string {
         </div>
         <span class="status-pill site-status ${status.cls}">${escape(status.text)}</span>
       </div>
-      <div class="site-meta">
-        ${destLine}
-        ${countsLine}
-        ${noteLine}
-      </div>
+      <div class="site-meta">${bodyLine}</div>
+      ${rangePicker}
       ${progress}
       <div class="site-actions">${actions.join('')}</div>
+      ${zipHint}
     </div>`;
 }
 
-function renderEnableModal(): string {
-  if (!ui.enableModal) return '';
-  const { label, error } = ui.enableModal;
-  // Capability check must run in the popup (window context) — the
-  // background service worker is a ServiceWorkerGlobalScope and never
-  // has showDirectoryPicker, regardless of browser.
-  const canPickFolder = supportsFolderPicker();
-
-  const body = canPickFolder
-    ? `
-        <p class="modal-body">Pick a folder on your computer. Your ${escape(label)} captures will be saved there as one markdown file per conversation.</p>
-        <div class="modal-actions">
-          <button class="link-button" data-action="modal-cancel">Cancel</button>
-          <button class="primary-button" data-action="modal-pick-folder">Choose folder</button>
+function renderRangePicker(siteId: SiteId, range: TimeRange): string {
+  const presetValue = range.kind === 'preset' ? range.preset : 'custom';
+  const presetOptions: Array<{ value: string; label: string }> = [
+    { value: '24h', label: PRESET_LABELS['24h'] },
+    { value: '7d', label: PRESET_LABELS['7d'] },
+    { value: '30d', label: PRESET_LABELS['30d'] },
+    { value: '90d', label: PRESET_LABELS['90d'] },
+    { value: 'all', label: PRESET_LABELS.all },
+    { value: 'custom', label: 'Custom…' },
+  ];
+  const optionsHtml = presetOptions
+    .map(
+      (o) =>
+        `<option value="${escape(o.value)}"${o.value === presetValue ? ' selected' : ''}>${escape(o.label)}</option>`
+    )
+    .join('');
+  const sinceValue =
+    range.kind === 'custom' ? range.sinceISODate : defaultSinceDate();
+  const untilValue =
+    range.kind === 'custom' ? range.untilISODate : todayISODate();
+  // Both date inputs only appear when "Custom…" is selected. They sit
+  // on a second row so the 400px popup width can fit them comfortably.
+  const customRow =
+    range.kind === 'custom'
+      ? `
+        <div class="site-range-custom">
+          <input type="date" class="site-range-date" data-site="${escape(siteId)}" data-edge="since" value="${escape(sinceValue)}" />
+          <span class="site-range-arrow">→</span>
+          <input type="date" class="site-range-date" data-site="${escape(siteId)}" data-edge="until" value="${escape(untilValue)}" />
         </div>`
-    : `
-        <p class="modal-body">Your browser doesn't support folder selection. ${escape(label)} captures will be saved to your Downloads folder:</p>
-        <p class="modal-code">~/Downloads/${escape(defaultDownloadsSubpath(label))}</p>
-        <div class="modal-actions">
-          <button class="link-button" data-action="modal-cancel">Cancel</button>
-          <button class="primary-button" data-action="modal-use-downloads">Save to Downloads</button>
-        </div>`;
-
+      : '';
   return `
-    <div class="modal-overlay">
-      <div class="modal-card">
-        <h1 class="modal-title">Enable ${escape(label)} capture</h1>
-        ${error ? `<p class="modal-error">${escape(error)}</p>` : ''}
-        ${body}
-      </div>
-    </div>`;
-}
-
-// Sum captures across sites that report a count. Sites on a Downloads
-// destination return null (we can't enumerate the folder), so we treat
-// them as "unknown" and skip them — better than lying with a low total.
-function totalCaptures(snapshot: PopupSnapshot | null): number | null {
-  if (!snapshot) return null;
-  let total = 0;
-  let anyKnown = false;
-  for (const s of snapshot.sites) {
-    if (s.captures_count !== null) {
-      total += s.captures_count;
-      anyKnown = true;
-    }
-  }
-  return anyKnown ? total : null;
+    <div class="site-range-row">
+      <label class="site-range-label">Range</label>
+      <select class="site-range-select" data-site="${escape(siteId)}">
+        ${optionsHtml}
+      </select>
+    </div>
+    ${customRow}`;
 }
 
 function renderHeader(): string {
-  const total = totalCaptures(ui.snapshot);
-  const stat =
-    total !== null
-      ? `<div class="pop-stat">
-           <span class="pop-stat-num">${total.toLocaleString()}</span>
-           <span class="pop-stat-label">${total === 1 ? 'capture' : 'captures'}</span>
-         </div>`
-      : '';
+  const miyoConnected = ui.snapshot?.miyo_connected === true;
+  const miyoBadge = miyoConnected
+    ? `<div class="miyo-indicator">● Miyo connected</div>`
+    : '';
   return `
     <div class="pop-head">
       <div>
         <span class="pop-wordmark">miyo</span><span class="pop-wordmark-sub">capture</span>
       </div>
-      ${stat}
+      ${miyoBadge}
     </div>
-    <p class="pop-tagline">Save your AI conversations as local markdown.</p>
+    <p class="pop-tagline">${
+      miyoConnected
+        ? 'Your Miyo library, kept in sync.'
+        : 'Save your AI conversations as local markdown.'
+    }</p>
   `;
 }
 
@@ -334,16 +417,25 @@ function renderFooter(): string {
   `;
 }
 
+function renderMiyoPromo(): string {
+  if (ui.snapshot?.miyo_connected === true) return '';
+  return `
+    <a class="miyo-promo" data-action="install-miyo" href="${escape(MIYO_INSTALL_URL)}" target="_blank" rel="noopener noreferrer">
+      <div class="miyo-promo-text">
+        <strong>Install Miyo</strong>
+        <span>Sync captures to a real library — search, link, and organize.</span>
+      </div>
+      <span class="miyo-promo-arrow" aria-hidden="true">→</span>
+    </a>
+  `;
+}
+
 function render(): void {
   if (ui.initializing) {
-    root.innerHTML = `
-      ${renderHeader()}
-      <div class="pop-loading">loading…</div>
-    `;
+    root.innerHTML = `${renderHeader()}<div class="pop-loading">loading…</div>`;
     return;
   }
   const sites = ui.snapshot?.sites ?? [];
-  const noneEnabled = sites.every((s) => !s.enabled);
 
   root.innerHTML = `
     ${renderHeader()}
@@ -352,395 +444,319 @@ function render(): void {
         ? `<div class="pop-banner ${ui.banner.kind === 'error' ? 'pop-banner-error' : 'pop-banner-info'}">${escape(ui.banner.text)}</div>`
         : ''
     }
-    ${
-      noneEnabled && sites.length > 0
-        ? `<div class="pop-empty">
-            <h2 class="pop-empty-title">Pick a site to start</h2>
-            <p class="pop-empty-desc">Captures stay on your machine, in a folder you choose.</p>
-           </div>`
-        : ''
-    }
+    ${renderMiyoPromo()}
     <div class="site-list">
       ${sites.map(renderSiteRow).join('')}
     </div>
     ${renderFooter()}
-    ${renderEnableModal()}
   `;
 
   root.querySelectorAll<HTMLButtonElement>('button[data-action]').forEach((btn) => {
     btn.addEventListener('click', () => {
       const action = btn.dataset.action;
       const site = btn.dataset.site as SiteId | undefined;
-      if (action === 'enable' && site) void onEnable(site);
-      else if (action === 'sync' && site) void onSync(site);
-      else if (action === 'pause' && site) void onPause(site);
-      else if (action === 'resume' && site) void onResume(site);
-      else if (action === 'disable' && site) void onDisable(site);
-      else if (action === 'reconnect' && site) void onReconnect(site);
-      else if (action === 'change-destination' && site) void onEnable(site);
-      else if (action === 'modal-pick-folder') void onPickFolder();
-      else if (action === 'modal-use-downloads') void onUseDownloads();
-      else if (action === 'modal-cancel') onModalCancel();
+      if (action === 'capture-zip' && site) void onCapture(site, 'zip');
+      else if (action === 'capture-miyo' && site) void onCapture(site, 'miyo');
+      else if (action === 'export-zip' && site) void onExportZip(site);
+      else if (action === 'cancel' && site) onCancel(site);
+      else if (action === 'open-site' && site) onOpenSite(site);
     });
   });
+
+  root.querySelectorAll<HTMLSelectElement>('select.site-range-select').forEach((sel) => {
+    sel.addEventListener('change', () => {
+      const site = sel.dataset.site as SiteId | undefined;
+      if (!site) return;
+      onRangePresetChange(site, sel.value);
+    });
+  });
+
+  root.querySelectorAll<HTMLInputElement>('input.site-range-date').forEach((inp) => {
+    inp.addEventListener('change', () => {
+      const site = inp.dataset.site as SiteId | undefined;
+      const edge = inp.dataset.edge as 'since' | 'until' | undefined;
+      if (!site || !edge) return;
+      onRangeCustomDateChange(site, edge, inp.value);
+    });
+  });
+}
+
+function onRangePresetChange(siteId: SiteId, value: string): void {
+  if (value === 'custom') {
+    const existing = getRange(siteId);
+    const sinceISODate =
+      existing.kind === 'custom' ? existing.sinceISODate : defaultSinceDate();
+    const untilISODate =
+      existing.kind === 'custom' ? existing.untilISODate : todayISODate();
+    ui.ranges[siteId] = { kind: 'custom', sinceISODate, untilISODate };
+  } else if (
+    value === '24h' ||
+    value === '7d' ||
+    value === '30d' ||
+    value === '90d' ||
+    value === 'all'
+  ) {
+    ui.ranges[siteId] = { kind: 'preset', preset: value };
+  } else {
+    return;
+  }
+  saveRanges();
+  render();
+}
+
+function onRangeCustomDateChange(
+  siteId: SiteId,
+  edge: 'since' | 'until',
+  value: string
+): void {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return;
+  const existing = getRange(siteId);
+  const sinceISODate =
+    existing.kind === 'custom' ? existing.sinceISODate : defaultSinceDate();
+  const untilISODate =
+    existing.kind === 'custom' ? existing.untilISODate : todayISODate();
+  ui.ranges[siteId] = {
+    kind: 'custom',
+    sinceISODate: edge === 'since' ? value : sinceISODate,
+    untilISODate: edge === 'until' ? value : untilISODate,
+  };
+  saveRanges();
+  // Skip render() so the user isn't bumped out of the date input
+  // mid-interaction. The visible value is already correct.
 }
 
 // ──────────────────────────────────────────────────────────────────
 // Actions
 // ──────────────────────────────────────────────────────────────────
 
-function findSite(siteId: SiteId): SiteRowSnapshot | null {
-  return ui.snapshot?.sites.find((s) => s.id === siteId) ?? null;
-}
-
-function onEnable(siteId: SiteId): void {
-  const s = findSite(siteId);
-  if (!s) return;
-  ui.enableModal = { siteId, label: s.label, error: null };
+function onCapture(siteId: SiteId, mode: 'zip' | 'miyo'): void {
+  ui.banner = null;
+  ui.capturing = siteId;
+  ui.captureProgress = { phase: 'listing', completed: 0, total: null };
+  const port = chrome.runtime.connect({ name: 'capture' });
+  ui.capturePort = port;
   render();
+  const startMsg: {
+    type: 'start';
+    site: SiteId;
+    mode: 'zip' | 'miyo';
+    range?: TimeRange;
+  } = { type: 'start', site: siteId, mode };
+  if (mode === 'zip') startMsg.range = getRange(siteId);
+  port.postMessage(startMsg);
+  wirePort(port, siteId);
 }
 
-function onModalCancel(): void {
-  ui.enableModal = null;
-  render();
+function onCancel(siteId: SiteId): void {
+  ui.capturePort?.postMessage({ type: 'cancel', site: siteId });
 }
 
-async function onPickFolder(): Promise<void> {
-  if (!ui.enableModal) return;
-  const { siteId } = ui.enableModal;
+function onOpenSite(siteId: SiteId): void {
+  const site = findSite(siteId);
+  if (site) void chrome.tabs.create({ url: site.home_url });
+}
 
-  const picker = (window as unknown as { showDirectoryPicker?: ShowDirectoryPicker })
-    .showDirectoryPicker;
-  if (!picker) {
-    ui.enableModal = { ...ui.enableModal, error: 'Folder picker not supported by this browser.' };
-    render();
-    return;
-  }
-
-  let handle: FileSystemDirectoryHandle;
+async function onExportZip(siteId: SiteId): Promise<void> {
+  const site = findSite(siteId);
+  if (!site) return;
+  ui.banner = null;
   try {
-    handle = await picker({
-      mode: 'readwrite',
-      id: `miyo-capture-${siteId}`,
-      startIn: 'documents',
-    });
-  } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      // User cancelled — keep modal open so they can retry or cancel.
+    const cache = await getCache(siteId);
+    const files = Object.values(cache).map((c) => ({
+      filename: c.filename,
+      content: c.markdown,
+    }));
+    if (files.length === 0) {
+      ui.banner = { kind: 'error', text: 'No captures to export. Click Capture first.' };
+      render();
       return;
     }
-    ui.enableModal = {
-      ...ui.enableModal,
-      error: err instanceof Error ? err.message : String(err),
+    const blob = buildZip(files);
+    const stamp = new Date().toISOString().slice(0, 10);
+    const zipName = `miyo-capture-${site.label.toLowerCase().replace(/\s+/g, '-')}-${stamp}.zip`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = zipName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Defer revocation so the download has time to start.
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    ui.banner = {
+      kind: 'info',
+      text: `Exported ${files.length} conversation${files.length === 1 ? '' : 's'} to ${zipName}`,
     };
     render();
-    return;
-  }
-
-  // Conflict check: does the folder already belong to another source?
-  try {
-    const fh = await handle.getFileHandle(META_FILENAME);
-    const file = await fh.getFile();
-    const existing = parseMeta(await file.text());
-    if (existing && existing.source.id !== siteId) {
-      ui.enableModal = {
-        ...ui.enableModal,
-        error: `This folder already holds captures from ${existing.source.label}. Pick a different folder.`,
-      };
-      render();
-      return;
-    }
   } catch (err) {
-    if (!(err instanceof DOMException && err.name === 'NotFoundError')) {
-      ui.enableModal = {
-        ...ui.enableModal,
-        error: err instanceof Error ? err.message : String(err),
-      };
-      render();
-      return;
-    }
+    ui.banner = { kind: 'error', text: err instanceof Error ? err.message : String(err) };
+    render();
   }
-
-  await setFolderHandle(siteId, handle);
-  await setSiteConfig(siteId, {
-    enabled: true,
-    paused: false,
-    destination: { kind: 'folder' },
-  });
-  ui.enableModal = null;
-  ui.banner = null;
-  // Refresh first so the site row renders as enabled, then kick off
-  // the first sync. The user just told us where their data should go;
-  // they expect it to start arriving immediately.
-  await onRefresh();
-  void onSync(siteId);
 }
 
-async function onUseDownloads(): Promise<void> {
-  if (!ui.enableModal) return;
-  const { siteId, label } = ui.enableModal;
-  await setSiteConfig(siteId, {
-    enabled: true,
-    paused: false,
-    destination: { kind: 'downloads', subpath: defaultDownloadsSubpath(label) },
-  });
-  ui.enableModal = null;
-  ui.banner = null;
-  await onRefresh();
-  void onSync(siteId);
-}
-
-async function onSync(siteId: SiteId): Promise<void> {
-  ui.banner = null;
-
-  // For folder destinations, ensure permission is granted before
-  // handing off to the background. The popup click is a user gesture,
-  // so requestPermission can prompt here; the SW cannot. If permission
-  // is already granted, requestPermission returns 'granted' without
-  // any user-facing prompt.
-  const site = findSite(siteId);
-  if (site?.destination_kind === 'folder') {
-    const handle = await getFolderHandle(siteId);
-    if (handle && !(await hasPermission(handle))) {
-      const granted = await requestPermission(handle);
-      if (!granted) {
-        ui.banner = {
-          kind: 'error',
-          text: 'Folder access denied. Cannot sync until you grant access.',
-        };
-        render();
-        return;
-      }
-      // Permission state changed; reflect it in the snapshot.
-      site.destination_needs_reauth = false;
-    }
-  }
-
-  ui.syncing = siteId;
-  ui.syncProgress = { completed: 0, total: null };
-  render();
-
-  const port = chrome.runtime.connect({ name: 'sync' });
-  port.postMessage({ type: 'start', site: siteId });
-  wireSyncPort(port, siteId);
-}
-
-// Shared port-message handler used by both fresh syncs (onSync) and
-// re-attach to an in-flight run (init). The protocol is the same in
-// both directions; only the opening message ('start' vs 'attach')
-// differs.
-function wireSyncPort(port: chrome.runtime.Port, siteId: SiteId): void {
+function wirePort(port: chrome.runtime.Port, siteId: SiteId): void {
   port.onMessage.addListener((msg) => {
     if (msg?.type === 'progress' && msg.site === siteId) {
-      ui.syncProgress = { completed: msg.completed, total: msg.total };
+      ui.captureProgress = {
+        phase: (msg.phase as 'listing' | 'fetching' | undefined) ?? 'fetching',
+        completed: msg.completed,
+        total: msg.total,
+      };
       render();
       return;
     }
     if (msg?.type === 'not_running' && msg.site === siteId) {
-      // SW says nothing is in flight — popup's active_sync was stale
-      // (likely from a previous browser session). Clear quietly and
-      // re-render to the idle state.
-      ui.syncing = null;
-      ui.syncProgress = null;
+      ui.capturing = null;
+      ui.captureProgress = null;
+      ui.capturePort = null;
       port.disconnect();
-      void chrome.storage.local.remove('active_sync');
-      void onRefresh();
+      void chrome.storage.local.remove('active_run');
+      void refresh();
       return;
     }
     if (msg?.type === 'done') {
-      const done = msg as SyncDone;
-      ui.syncing = null;
-      ui.syncProgress = null;
+      const done = msg as CaptureDone;
+      ui.capturing = null;
+      ui.captureProgress = null;
+      ui.capturePort = null;
       if (done.result.kind === 'completed') {
-        ui.banner = {
-          kind: 'info',
-          text:
-            done.result.errors > 0
-              ? `Captured ${done.result.written} new (${done.result.errors} failed).`
-              : `Captured ${done.result.written} new.`,
-        };
-      } else if (done.result.kind === 'paused') {
-        ui.banner = {
-          kind: 'info',
-          text: `Paused at ${done.result.written}. Click Sync to continue.`,
-        };
+        const { written, errors, mode } = done.result;
+        if (mode === 'miyo') {
+          ui.banner = {
+            kind: 'info',
+            text:
+              written === 0
+                ? 'Nothing new to send. Miyo is up to date.'
+                : errors > 0
+                  ? `Sent ${written} to Miyo (${errors} failed).`
+                  : `Sent ${written} to Miyo.`,
+          };
+        } else if (written > 0) {
+          // Auto-download the zip. onExportZip sets its own
+          // "Exported N to <file>" banner once the blob is built,
+          // overwriting this transient one within tens of ms.
+          const saturated = done.result.saturated === true;
+          const rangeDesc = describeRange(getRange(done.site));
+          let text = `Captured ${written} from ${rangeDesc}`;
+          if (errors > 0) text += ` (${errors} failed)`;
+          if (saturated) text += ' — more in range; narrow your range to get older ones';
+          text += '. Preparing download…';
+          ui.banner = { kind: 'info', text };
+          void onExportZip(done.site);
+        } else {
+          const rangeDesc = describeRange(getRange(done.site));
+          ui.banner = {
+            kind: 'info',
+            text:
+              errors > 0
+                ? `Capture finished with ${errors} error${errors === 1 ? '' : 's'}.`
+                : `Nothing in ${rangeDesc} to capture.`,
+          };
+        }
       } else {
-        ui.banner = { kind: 'error', text: explainAbort(done.result.reason) };
+        const kind = done.result.reason === 'cancelled' ? 'info' : 'error';
+        ui.banner = { kind, text: explainAbort(done.result.reason) };
       }
       port.disconnect();
-      void onRefresh();
+      void refresh();
     }
   });
   port.onDisconnect.addListener(() => {
-    if (ui.syncing === siteId) {
-      ui.syncing = null;
-      ui.syncProgress = null;
+    if (ui.capturing === siteId) {
+      ui.capturing = null;
+      ui.captureProgress = null;
+      ui.capturePort = null;
       render();
     }
   });
 }
 
-async function getActiveSyncSite(): Promise<SiteId | null> {
-  const obj = await chrome.storage.local.get('active_sync');
-  const entry = obj.active_sync as { site?: string } | undefined;
+function explainAbort(reason: string): string {
+  switch (reason) {
+    case 'cancelled':
+      return 'Capture stopped.';
+    case 'signed_out':
+      return 'You are signed out. Sign in and try again.';
+    case 'busy':
+      return 'Another capture is already running.';
+    case 'miyo_unavailable':
+      return 'Lost connection to Miyo. Reopen the popup to retry.';
+    default:
+      return `Capture stopped: ${reason}`;
+  }
+}
+
+async function getActiveRunSite(): Promise<SiteId | null> {
+  const obj = await chrome.storage.local.get('active_run');
+  const entry = obj.active_run as { site?: string } | undefined;
   return (entry?.site as SiteId | undefined) ?? null;
 }
 
-// Re-attach the popup to a sync that's already running in the SW. No
-// permission check — the SW is mid-write, so it already has whatever
-// access it needs. The popup's own queryPermission would lie ('prompt')
-// for a freshly-opened document and is the wrong source of truth here.
-function attachToRunningSync(siteId: SiteId): void {
-  ui.syncing = siteId;
-  ui.syncProgress = { completed: 0, total: null };
-
-  const port = chrome.runtime.connect({ name: 'sync' });
+function attachToRunningRun(siteId: SiteId): void {
+  ui.capturing = siteId;
+  ui.captureProgress = { phase: 'listing', completed: 0, total: null };
+  const port = chrome.runtime.connect({ name: 'capture' });
+  ui.capturePort = port;
   port.postMessage({ type: 'attach', site: siteId });
-  wireSyncPort(port, siteId);
+  wirePort(port, siteId);
 }
 
-function explainAbort(reason: string): string {
-  switch (reason) {
-    case 'paused':
-      return 'This site is paused. Resume to sync.';
-    case 'not_enabled':
-      return 'This site is not enabled.';
-    case 'not_configured':
-      return 'Pick a destination folder first.';
-    case 'handle_missing':
-    case 'permission_revoked':
-      return 'Folder access lost. Reconnect to resume.';
-    case 'signed_out':
-      return 'You are signed out of this site. Sign in and try again.';
-    default:
-      if (reason.startsWith('destination_belongs_to_')) {
-        return `This folder is for another source (${reason.replace('destination_belongs_to_', '')}). Pick a different folder.`;
-      }
-      return `Sync stopped: ${reason}`;
-  }
-}
-
-async function onPause(siteId: SiteId): Promise<void> {
-  await setSiteConfig(siteId, { paused: true });
-  await onRefresh();
-}
-
-async function onResume(siteId: SiteId): Promise<void> {
-  await setSiteConfig(siteId, { paused: false });
-  await onRefresh();
-}
-
-async function onDisable(siteId: SiteId): Promise<void> {
-  const cfg = await getSiteConfig(siteId);
-  // Keep destination so re-enable is one click. Disable just sets the
-  // flag; nothing is deleted.
-  await setSiteConfig(siteId, { ...cfg, enabled: false, paused: false });
-  await onRefresh();
-}
-
-async function onReconnect(siteId: SiteId): Promise<void> {
-  const handle = await getFolderHandle(siteId);
-  if (!handle) {
-    // Handle is gone entirely — fall back to the enable flow.
-    onEnable(siteId);
-    return;
-  }
-  const ok = await requestPermission(handle);
-  if (!ok) {
-    ui.banner = { kind: 'error', text: 'Permission denied. The folder cannot be accessed.' };
-    render();
-    return;
-  }
-  await onRefresh();
-}
-
-// File System Access permissions can be 'granted' for the popup window
-// but reported differently from the service worker. The popup runs in
-// a real window context, so its hasPermission() answer is the truth —
-// EXCEPT when a sync is currently writing in the SW. In that case the
-// SW already has functional access, and the popup's queryPermission
-// returning 'prompt' is a stale view of the new document context,
-// not a real revocation. Surface as "needs_reauth" only when the
-// SW isn't actively using the handle.
-async function enrichPermissions(
-  snapshot: PopupSnapshot,
-  activeSyncSite: SiteId | null
-): Promise<void> {
-  await Promise.all(
-    snapshot.sites.map(async (site) => {
-      if (!site.enabled || site.destination_kind !== 'folder') return;
-      const handle = await getFolderHandle(site.id);
-      if (!handle) {
-        site.destination_missing = true;
-        return;
-      }
-      if (activeSyncSite === site.id) {
-        // SW is mid-sync; trust the writes, not the popup's view.
-        site.destination_needs_reauth = false;
-        return;
-      }
-      // Handle is in IndexedDB but permission may need re-granting
-      // for this session — that's a soft state, not "missing."
-      site.destination_needs_reauth = !(await hasPermission(handle));
-    })
-  );
-}
-
-async function onRefresh(): Promise<void> {
+async function refresh(): Promise<void> {
   try {
     ui.snapshot = (await chrome.runtime.sendMessage({ type: 'snapshot' })) as PopupSnapshot;
-    const active = await getActiveSyncSite();
-    if (ui.snapshot) await enrichPermissions(ui.snapshot, active);
   } catch (err) {
     ui.banner = { kind: 'error', text: err instanceof Error ? err.message : String(err) };
   }
   render();
 }
 
+async function loadCachedSnapshot(): Promise<PopupSnapshot | null> {
+  try {
+    const obj = await chrome.storage.local.get('last_snapshot');
+    return (obj.last_snapshot as PopupSnapshot | undefined) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Stale-while-revalidate: paint the cached snapshot immediately so
+// the popup feels instant, then kick off a fresh snapshot request in
+// the background and re-render when it lands. The fresh fetch can
+// take 200–1500 ms (remote session probes); doing it off the paint
+// path means the user sees content right away.
 async function init(): Promise<void> {
   render();
-  try {
-    // First paint: cached snapshot only. The 'snapshot' handler in the
-    // SW reads chrome.storage.local without hitting any external API,
-    // so this returns in a handful of ms. 'open'/'probe' would block on
-    // probeAll() — a fresh fetch per enabled site to claude.ai/chatgpt
-    // — which adds 500–2000ms of dead air before the popup renders
-    // anything useful.
-    const [snapshot, active] = await Promise.all([
-      chrome.runtime.sendMessage({ type: 'snapshot' }) as Promise<PopupSnapshot>,
-      getActiveSyncSite(),
-    ]);
-    ui.snapshot = snapshot;
-    if (ui.snapshot) await enrichPermissions(ui.snapshot, active);
-    if (active) attachToRunningSync(active);
-  } catch (err) {
-    ui.banner = { kind: 'error', text: err instanceof Error ? err.message : String(err) };
-  } finally {
+
+  // Load persisted ranges in parallel with the cached snapshot. Both
+  // are storage.local reads (~5 ms each) so they pipeline well.
+  const [cached, ranges] = await Promise.all([loadCachedSnapshot(), loadRanges()]);
+  ui.ranges = ranges;
+  if (cached) {
+    ui.snapshot = cached;
     ui.initializing = false;
     render();
   }
 
-  // Background refresh: kick off the actual probe (network calls to
-  // claude.ai / chatgpt). The cached snapshot we just rendered may show
-  // a session as signed-in when the user has since signed out elsewhere
-  // — that lie self-corrects when this returns. Fire-and-forget; probe
-  // failures are silent because the user can already see / use the
-  // cached state.
-  void refreshSessions();
-}
+  // Attach to any in-flight capture without blocking the fresh probe.
+  void getActiveRunSite().then((active) => {
+    if (active && ui.capturing !== active) attachToRunningRun(active);
+  });
 
-async function refreshSessions(): Promise<void> {
+  // Fire the fresh snapshot. Don't await before painting — the cached
+  // render is already up. When this resolves, update and re-render.
   try {
-    const fresh = (await chrome.runtime.sendMessage({
-      type: 'probe',
+    const snapshot = (await chrome.runtime.sendMessage({
+      type: 'snapshot',
     })) as PopupSnapshot;
-    if (!fresh) return;
-    const active = await getActiveSyncSite();
-    await enrichPermissions(fresh, active);
-    ui.snapshot = fresh;
+    ui.snapshot = snapshot;
+  } catch (err) {
+    // Only surface the error if we had nothing cached to show.
+    if (!cached) {
+      ui.banner = { kind: 'error', text: err instanceof Error ? err.message : String(err) };
+    }
+  } finally {
+    ui.initializing = false;
     render();
-  } catch {
-    // Best-effort; cached state stays on screen.
   }
 }
 

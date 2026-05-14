@@ -1,199 +1,295 @@
 // Service worker entry.
 //
-// Responsibilities:
-//   1. Snapshot building for the popup. Composes per-site config
-//      (enabled / paused / destination), state (session, last sync),
-//      and folder-derived info (capture count read from the
-//      .miyo-capture.json in the destination folder, when available).
-//   2. Session probing — runs each enabled adapter's probeSession on
-//      startup, install, and on popup-driven refresh.
-//   3. The sync orchestrator's host. The popup opens a port named
-//      'sync' and tells us which site to sync; we run runSync and
-//      pipe progress back over the port.
+// Responsibilities, in order of complexity:
 //
-// We deliberately do NOT auto-sync. The only trigger is a user
-// clicking Sync now in the popup. There are no alarms, no cookie
-// listeners that fan out to fetches, no timers.
+//   1. Snapshot building. The popup opens a port and asks for a
+//      snapshot; we probe each site's session, try to talk to Miyo,
+//      and (when Miyo answers) compute a per-site delta count. The
+//      whole probe completes in ~1 s and the popup renders once.
 //
-// Per-site config writes (enable / disable / pause / resume / set
-// destination) are handled directly by the popup writing to
-// chrome.storage.local and IndexedDB. They do not require the
-// background to mediate.
+//   2. Capture dispatch. The popup tells us to capture a site in
+//      either 'zip' or 'miyo' mode; we own the run so it survives
+//      popup-close. Progress streams back over the port.
+//
+//   3. Badge animation while a run is in flight.
+//
+// What we DO NOT do anymore:
+//   • chrome.alarms keepalive. A 200-item run finishes well inside
+//     the SW idle threshold; if it dies, the cache (zip) or Miyo's
+//     index (Miyo) makes the retry idempotent.
+//   • Folder permissions, destinations, downloads-fallback. All gone.
+//   • Per-site state, sync progress, meta reconciliation. All gone.
 
 import { ADAPTERS, getAdapter } from '../adapters/index.js';
-import { runSync } from '../framework/sync.js';
-import { getSiteState, patchSiteState } from '../framework/state.js';
-import { getSiteConfig, getFolderHandle } from '../framework/destinations.js';
-import { makeWriter } from '../framework/writer.js';
+import {
+  captureForExport,
+  captureToMiyo,
+  indexFromMetadata,
+  probeMiyoDelta,
+} from '../framework/capture.js';
+import { cachedCount } from '../framework/cache.js';
+import { MiyoClient, MiyoUnavailableError } from '../framework/miyo.js';
 import type {
   PopupSnapshot,
   SiteAdapter,
   SiteId,
-  SiteRowSnapshot,
+  SiteRow,
+  SiteSession,
+  TimeRange,
 } from '../framework/types.js';
+import { DEFAULT_TIME_RANGE } from '../framework/types.js';
 
-// ──────────────────────────────────────────────────────────────────
-// Keepalive
-// ──────────────────────────────────────────────────────────────────
+// Convert a TimeRange to an epoch-ms window [sinceMs, untilMs) for
+// capture filtering. Either bound may be null for open-ended.
 //
-// MV3 service workers are idle-killed after ~30s without chrome.* API
-// events. A long-running sync mostly awaits fetch() and IndexedDB,
-// which reset the timer most of the time but not reliably between
-// fetches. We belt-and-suspender with chrome.alarms: a recurring alarm
-// is a chrome event that wakes the SW even if it had gone idle, and
-// (more importantly) keeps it from being marked idle in the first
-// place. The listener does nothing — the wake-up itself is the point.
-
-const KEEPALIVE_ALARM = 'sync-keepalive';
-
-function startKeepalive(): void {
-  // 30s is the minimum periodInMinutes-supported interval (0.5 min).
-  // Right at the idle threshold, but reliable in practice because the
-  // alarm fires *as* the SW is about to go idle, not after.
-  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
-}
-
-function stopKeepalive(): void {
-  void chrome.alarms.clear(KEEPALIVE_ALARM);
-}
-
-chrome.alarms.onAlarm.addListener(() => {
-  // Wake-up only; the SW running this listener is itself the work.
-});
-
-// ──────────────────────────────────────────────────────────────────
-// In-flight sync tracking
-// ──────────────────────────────────────────────────────────────────
-//
-// One sync run at a time across all sites. Subscribers (popup ports)
-// can attach mid-run; they all see the same progress stream. The
-// active_sync entry in chrome.storage.local mirrors `runningSync.siteId`
-// for the popup to read on init — necessary because a freshly-opened
-// popup gets a new document context and doesn't know what the SW is
-// doing until it asks.
-
-interface RunningSync {
-  siteId: SiteId;
-  subscribers: Set<chrome.runtime.Port>;
-  progress: { completed: number; total: number | null };
-}
-
-let runningSync: RunningSync | null = null;
-
-const ACTIVE_SYNC_KEY = 'active_sync';
-
-async function setActiveSyncState(site: SiteId | null): Promise<void> {
-  if (site === null) {
-    await chrome.storage.local.remove(ACTIVE_SYNC_KEY);
-  } else {
-    await chrome.storage.local.set({
-      [ACTIVE_SYNC_KEY]: { site, started_at: Date.now() },
-    });
+// Presets are now-relative: untilMs is open-ended (null) so newly
+// arrived items are included. Custom uses an inclusive end date:
+// untilMs is set to the day *after* `untilISODate` at 00:00 local, so
+// the user-picked end date is fully included in the window.
+function rangeToWindow(range: TimeRange): {
+  sinceMs: number | null;
+  untilMs: number | null;
+} {
+  const DAY_MS = 86_400_000;
+  if (range.kind === 'custom') {
+    const sinceMs = Date.parse(`${range.sinceISODate}T00:00`);
+    const untilStart = new Date(`${range.untilISODate}T00:00`);
+    const untilMs = Number.isFinite(untilStart.getTime())
+      ? untilStart.getTime() + DAY_MS // exclusive upper = start of next day
+      : null;
+    return {
+      sinceMs: Number.isFinite(sinceMs) ? sinceMs : null,
+      untilMs,
+    };
   }
+  const now = Date.now();
+  let sinceMs: number | null;
+  switch (range.preset) {
+    case '24h':
+      sinceMs = now - DAY_MS;
+      break;
+    case '7d':
+      sinceMs = now - 7 * DAY_MS;
+      break;
+    case '30d':
+      sinceMs = now - 30 * DAY_MS;
+      break;
+    case '90d':
+      sinceMs = now - 90 * DAY_MS;
+      break;
+    case 'all':
+      sinceMs = null;
+      break;
+  }
+  return { sinceMs, untilMs: null };
 }
 
-function broadcastToSubscribers(entry: RunningSync, msg: unknown): void {
-  for (const port of entry.subscribers) {
-    try {
-      port.postMessage(msg);
-    } catch {
-      // Subscriber's popup closed; will be cleaned up on its own
-      // onDisconnect. Ignore here.
+// ──────────────────────────────────────────────────────────────────
+// Miyo client lifecycle
+// ──────────────────────────────────────────────────────────────────
+//
+// One MiyoClient cache pointer in the SW. Re-probed fresh on every
+// popup snapshot (`forceProbe: true`) so the connected/disconnected
+// state always reflects Miyo's current liveness — not a stale "we
+// connected earlier this session" reading. Within a single capture
+// run, the run holds its own client reference, so wiping the cache
+// here doesn't disturb it.
+//
+// For non-snapshot callers (the capture dispatch path), we still
+// reuse the cache if it's alive — a single popup interaction does
+// snapshot → start capture, so the capture inherits the fresh probe.
+
+let miyo: MiyoClient | null = null;
+
+async function getMiyo(forceProbe = false): Promise<MiyoClient | null> {
+  if (!forceProbe && miyo && miyo.isAlive()) return miyo;
+  // Drop the cache pointer (do NOT call disconnect() — that would
+  // mark an in-flight capture's client dead).
+  miyo = null;
+  try {
+    miyo = await MiyoClient.connect();
+    return miyo;
+  } catch (err) {
+    // Expected for every user without the Miyo desktop app — keep
+    // quiet here, the zip-mode UI is the answer.
+    if (!(err instanceof MiyoUnavailableError)) {
+      console.warn('miyo connect failed', err);
     }
+    miyo = null;
+    return null;
   }
 }
 
-async function buildSiteRow(adapter: SiteAdapter): Promise<SiteRowSnapshot> {
-  const [config, state] = await Promise.all([
-    getSiteConfig(adapter.id),
-    getSiteState(adapter.id),
-  ]);
+// ──────────────────────────────────────────────────────────────────
+// Snapshot
+// ──────────────────────────────────────────────────────────────────
 
-  let destinationLabel: string | null = null;
-  let destinationMissing = false;
-  let capturesCount: number | null = null;
+async function probeSession(adapter: SiteAdapter): Promise<SiteSession> {
+  try {
+    return await adapter.probeSession();
+  } catch {
+    return { signedIn: false, email: null };
+  }
+}
 
-  if (config.destination?.kind === 'downloads') {
-    destinationLabel = `~/Downloads/${config.destination.subpath}`;
-  } else if (config.destination?.kind === 'folder') {
-    const handle = await getFolderHandle(adapter.id);
-    if (!handle) {
-      destinationMissing = true;
-      destinationLabel = '(folder no longer available)';
-    } else {
-      destinationLabel = handle.name;
-      // Best-effort read of meta to surface the capture count. Failures
-      // here (including permission issues) just leave the count null —
-      // we don't try to diagnose permission state from the SW since
-      // queryPermission cross-context is unreliable. The popup does
-      // the real permission check in its window context.
+async function buildRow(
+  adapter: SiteAdapter,
+  miyoIndexFor: Map<string, string> | null
+): Promise<SiteRow> {
+  const sessionPromise = probeSession(adapter);
+
+  // When Miyo is connected we compute the live delta against its
+  // index. The probe is a single listItems call per site, paged up to
+  // MAX_PROBE_PAGES (see capture.ts) — fast enough for popup open.
+  let miyoTotal: number | null = null;
+  let newAvailable: number | null = null;
+  let newSaturated = false;
+
+  if (miyoIndexFor) {
+    miyoTotal = miyoIndexFor.size;
+    const session = await sessionPromise;
+    if (session.signedIn) {
       try {
-        const wr = await makeWriter(adapter.id, config);
-        if (wr.ok) {
-          const meta = await wr.writer.readMeta();
-          if (meta) capturesCount = Object.keys(meta.captures).length;
-        }
+        const probe = await probeMiyoDelta(adapter, miyoIndexFor);
+        newAvailable = probe.count;
+        newSaturated = probe.saturated;
       } catch {
-        // Ignored; popup will reconcile.
+        // Best-effort. UI shows "—" for unknown counts.
       }
     }
   }
+
+  const cached = miyoIndexFor === null ? await cachedCount(adapter.id) : null;
+  const session = await sessionPromise;
 
   return {
     id: adapter.id,
     label: adapter.label,
     home_url: adapter.home_url,
-    enabled: config.enabled,
-    paused: config.paused,
-    destination_kind: config.destination?.kind ?? null,
-    destination_label: destinationLabel,
-    destination_missing: destinationMissing,
-    // destination_needs_reauth is filled in by the popup — the SW
-    // cannot reliably read FS Access permission state cross-context.
-    destination_needs_reauth: false,
-    captures_count: capturesCount,
-    session: state.last_session,
-    last_sync_at: state.last_sync_at,
-    last_sync_error: state.last_sync_error,
+    brand_color: adapter.brand_color ?? null,
+    session,
+    cached_count: cached,
+    miyo_total: miyoTotal,
+    new_available: newAvailable,
+    new_available_saturated: newSaturated,
   };
 }
 
 async function buildSnapshot(): Promise<PopupSnapshot> {
-  const sites = await Promise.all(ADAPTERS.map(buildSiteRow));
-  return {
+  // Force a fresh /v0/health probe on every popup open — see getMiyo()
+  // comment for why we drop the cache here.
+  const client = await getMiyo(true);
+  let miyoIndices: Map<SiteId, Map<string, string>> | null = null;
+
+  if (client) {
+    miyoIndices = new Map();
+    // Ensure the app folder + read metadata for each source in
+    // parallel. ensureAppFolder is idempotent and returns the
+    // existing metadata inline so we don't need a second GET.
+    // Tolerate per-source failure — show "—" for that row instead
+    // of failing the whole snapshot.
+    await Promise.all(
+      ADAPTERS.map(async (a) => {
+        try {
+          const info = await client.ensureAppFolder(a.id, a.label);
+          miyoIndices!.set(a.id, indexFromMetadata(info.metadata));
+        } catch {
+          miyoIndices!.set(a.id, new Map());
+        }
+      })
+    );
+  }
+
+  const sites = await Promise.all(
+    ADAPTERS.map((a) => buildRow(a, miyoIndices?.get(a.id) ?? null))
+  );
+
+  const snapshot: PopupSnapshot = {
+    miyo_connected: client !== null,
     sites,
-    active_sync: null,
   };
+
+  // Cache for stale-while-revalidate in the popup. Best-effort —
+  // a storage write failure shouldn't fail the snapshot.
+  void chrome.storage.local.set({ last_snapshot: snapshot });
+
+  return snapshot;
 }
 
-async function probeAll(): Promise<void> {
-  // Only probe enabled sites — no need to hit network for sites the
-  // user hasn't opted into.
-  await Promise.all(
-    ADAPTERS.map(async (a) => {
-      const config = await getSiteConfig(a.id);
-      if (!config.enabled) return;
-      try {
-        const session = await a.probeSession();
-        await patchSiteState(a.id, { last_session: session, last_probe_at: Date.now() });
-      } catch {
-        await patchSiteState(a.id, {
-          last_session: { signedIn: false, email: null },
-          last_probe_at: Date.now(),
-        });
-      }
-    })
-  );
+// ──────────────────────────────────────────────────────────────────
+// Toolbar badge — capture-in-progress indicator
+// ──────────────────────────────────────────────────────────────────
+
+const BADGE_FRAMES = ['•', '• •', '• • •'];
+const BADGE_FRAME_MS = 450;
+const BADGE_COLOR = '#0f766e';
+
+let badgeAnimationTimer: ReturnType<typeof setInterval> | null = null;
+
+function showBadge(label: string): void {
+  void chrome.action.setBadgeBackgroundColor({ color: BADGE_COLOR });
+  void chrome.action.setTitle({ title: `Miyo Capture — capturing ${label}…` });
+  let frame = 0;
+  void chrome.action.setBadgeText({ text: BADGE_FRAMES[frame]! });
+  if (badgeAnimationTimer !== null) clearInterval(badgeAnimationTimer);
+  badgeAnimationTimer = setInterval(() => {
+    frame = (frame + 1) % BADGE_FRAMES.length;
+    void chrome.action.setBadgeText({ text: BADGE_FRAMES[frame]! });
+  }, BADGE_FRAME_MS);
+}
+
+function clearBadge(): void {
+  if (badgeAnimationTimer !== null) {
+    clearInterval(badgeAnimationTimer);
+    badgeAnimationTimer = null;
+  }
+  void chrome.action.setBadgeText({ text: '' });
+  void chrome.action.setTitle({ title: 'Miyo Capture' });
+}
+
+// Defensive: on SW wake-up, runningRun is null but the badge state
+// is owned by the browser and may have survived a previous instance's
+// death. Clear it once at module load.
+clearBadge();
+
+// ──────────────────────────────────────────────────────────────────
+// Capture run dispatch
+// ──────────────────────────────────────────────────────────────────
+
+interface RunningRun {
+  siteId: SiteId;
+  mode: 'zip' | 'miyo';
+  subscribers: Set<chrome.runtime.Port>;
+  progress: { phase: 'listing' | 'fetching'; completed: number; total: number | null };
+  cancelRequested: boolean;
+}
+
+let runningRun: RunningRun | null = null;
+const ACTIVE_RUN_KEY = 'active_run';
+
+async function setActiveRunMirror(siteId: SiteId | null): Promise<void> {
+  if (siteId === null) {
+    await chrome.storage.local.remove(ACTIVE_RUN_KEY);
+  } else {
+    await chrome.storage.local.set({
+      [ACTIVE_RUN_KEY]: { site: siteId, started_at: Date.now() },
+    });
+  }
+}
+
+function broadcast(entry: RunningRun, msg: unknown): void {
+  for (const port of entry.subscribers) {
+    try {
+      port.postMessage(msg);
+    } catch {
+      // Subscriber gone; cleanup happens via onDisconnect.
+    }
+  }
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     try {
-      if (msg?.type === 'open' || msg?.type === 'probe') {
-        await probeAll();
-        sendResponse(await buildSnapshot());
-        return;
-      }
       if (msg?.type === 'snapshot') {
         sendResponse(await buildSnapshot());
         return;
@@ -207,45 +303,54 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== 'sync') return;
+  if (port.name !== 'capture') return;
 
   const safePost = (msg: unknown): void => {
     try {
       port.postMessage(msg);
     } catch {
-      // Port already disconnected; ignored.
+      // already gone
     }
   };
 
   port.onDisconnect.addListener(() => {
-    if (runningSync) runningSync.subscribers.delete(port);
+    if (runningRun) runningRun.subscribers.delete(port);
   });
 
   port.onMessage.addListener((msg) => {
     if (typeof msg !== 'object' || msg === null) return;
-    const m = msg as { type?: string; site?: string };
+    const m = msg as {
+      type?: string;
+      site?: string;
+      mode?: 'zip' | 'miyo';
+      range?: TimeRange;
+    };
 
-    // Re-attach from a freshly-opened popup. No new run, no permission
-    // check — the SW already has whatever access it needed for the
-    // in-flight sync.
+    if (m.type === 'cancel' && typeof m.site === 'string') {
+      if (runningRun && runningRun.siteId === m.site) {
+        runningRun.cancelRequested = true;
+      }
+      return;
+    }
+
     if (m.type === 'attach' && typeof m.site === 'string') {
-      if (runningSync && runningSync.siteId === m.site) {
-        runningSync.subscribers.add(port);
+      if (runningRun && runningRun.siteId === m.site) {
+        runningRun.subscribers.add(port);
         safePost({
           type: 'progress',
           site: m.site,
-          completed: runningSync.progress.completed,
-          total: runningSync.progress.total,
+          phase: runningRun.progress.phase,
+          completed: runningRun.progress.completed,
+          total: runningRun.progress.total,
         });
       } else {
-        // No matching run. The popup will clear its stale active_sync
-        // and re-render to the idle state.
         safePost({ type: 'not_running', site: m.site });
       }
       return;
     }
 
     if (m.type !== 'start' || typeof m.site !== 'string') return;
+    if (m.mode !== 'zip' && m.mode !== 'miyo') return;
 
     const adapter = getAdapter(m.site);
     if (!adapter) {
@@ -257,21 +362,20 @@ chrome.runtime.onConnect.addListener((port) => {
       return;
     }
 
-    // Dedup: if this site is already syncing, attach instead of starting
-    // a second concurrent run.
-    if (runningSync && runningSync.siteId === adapter.id) {
-      runningSync.subscribers.add(port);
+    // Reattach if this site is already running.
+    if (runningRun && runningRun.siteId === adapter.id) {
+      runningRun.subscribers.add(port);
       safePost({
         type: 'progress',
         site: adapter.id,
-        completed: runningSync.progress.completed,
-        total: runningSync.progress.total,
+        phase: runningRun.progress.phase,
+        completed: runningRun.progress.completed,
+        total: runningRun.progress.total,
       });
       return;
     }
 
-    // A different site is already syncing — refuse, surface as aborted.
-    if (runningSync) {
+    if (runningRun) {
       safePost({
         type: 'done',
         site: adapter.id,
@@ -280,49 +384,69 @@ chrome.runtime.onConnect.addListener((port) => {
       return;
     }
 
-    // Start a fresh run.
-    const entry: RunningSync = {
+    const entry: RunningRun = {
       siteId: adapter.id,
+      mode: m.mode,
       subscribers: new Set([port]),
-      progress: { completed: 0, total: null },
+      progress: { phase: 'listing', completed: 0, total: null },
+      cancelRequested: false,
     };
-    runningSync = entry;
-    startKeepalive();
-    void setActiveSyncState(adapter.id);
+    runningRun = entry;
+    showBadge(adapter.label);
+    void setActiveRunMirror(adapter.id);
 
     void (async () => {
       try {
-        const result = await runSync(adapter, {
-          onProgress: ({ completed, total }) => {
-            entry.progress = { completed, total };
-            broadcastToSubscribers(entry, {
+        const callbacks = {
+          onProgress: ({
+            phase,
+            completed,
+            total,
+          }: {
+            phase: 'listing' | 'fetching';
+            completed: number;
+            total: number | null;
+          }) => {
+            entry.progress = { phase, completed, total };
+            broadcast(entry, {
               type: 'progress',
               site: adapter.id,
+              phase,
               completed,
               total,
             });
           },
-        });
-        broadcastToSubscribers(entry, { type: 'done', site: adapter.id, result });
+          isCancelled: () => entry.cancelRequested,
+        };
+
+        let result;
+        if (m.mode === 'miyo') {
+          const client = await getMiyo();
+          if (!client) {
+            result = { kind: 'aborted' as const, reason: 'miyo_unavailable' };
+          } else {
+            result = await captureToMiyo(adapter, client, callbacks);
+          }
+        } else {
+          const range: TimeRange = m.range ?? DEFAULT_TIME_RANGE;
+          const { sinceMs, untilMs } = rangeToWindow(range);
+          result = await captureForExport(adapter, sinceMs, untilMs, callbacks);
+        }
+        broadcast(entry, { type: 'done', site: adapter.id, result });
       } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        broadcastToSubscribers(entry, {
+        broadcast(entry, {
           type: 'done',
           site: adapter.id,
-          result: { kind: 'aborted', reason: message },
+          result: {
+            kind: 'aborted',
+            reason: err instanceof Error ? err.message : String(err),
+          },
         });
       } finally {
-        if (runningSync === entry) runningSync = null;
-        stopKeepalive();
-        await setActiveSyncState(null);
+        if (runningRun === entry) runningRun = null;
+        clearBadge();
+        await setActiveRunMirror(null);
       }
     })();
   });
-});
-
-chrome.runtime.onInstalled.addListener(() => {
-  void probeAll();
-});
-chrome.runtime.onStartup.addListener(() => {
-  void probeAll();
 });

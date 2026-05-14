@@ -45,9 +45,12 @@ const ORG_CACHE_KEY = 'org:claude';
 // Claude's /chat_conversations endpoint historically returned the full
 // list. As of 2026 it paginates server-side, defaulting to a small page
 // (~6–30 most-recent) when called without query params. We pass an
-// explicit ?limit and ?offset so we control the page size; 200 is a
-// round-trip-friendly balance for users with hundreds of chats.
-const PAGE_SIZE = 200;
+// explicit ?limit and ?offset so we control the page size. The probe
+// runs on every popup-open, so we want the page small enough that we
+// don't ship 50KB of titles+timestamps each time, but large enough
+// that "X new" stays an exact count for typical weekly activity
+// before saturating to "N+".
+const PAGE_SIZE = 50;
 
 async function claudeApi<T>(urlPath: string): Promise<T> {
   const res = await fetch(`https://claude.ai${urlPath}`, {
@@ -137,7 +140,11 @@ function toMessages(full: ClaudeFullConversation): ChatMessage[] {
 }
 
 export const claudeAdapter: ChatSiteAdapter = {
-  id: 'claude',
+  // Internal id matches the desktop Miyo's Platform type ('claude_ai').
+  // Keeping the two aligned means files captured by either path have
+  // an identical `platform:` frontmatter and Miyo addresses one app
+  // folder for both.
+  id: 'claude_ai',
   label: 'Claude',
   home_url: 'https://claude.ai',
   brand_color: '#c66439',
@@ -213,7 +220,7 @@ export const claudeAdapter: ChatSiteAdapter = {
       `/api/organizations/${orgId}/chat_conversations/${id}?tree=True&rendering_mode=raw`
     );
     return {
-      site: 'claude',
+      site: 'claude_ai',
       conversation_id: full.uuid,
       title: full.name,
       url: `https://claude.ai/chat/${full.uuid}`,

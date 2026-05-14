@@ -116,6 +116,20 @@ main {
   line-height: 1;
 }
 
+.miyo-indicator {
+  display: inline-flex;
+  align-items: center;
+  font-family: 'Fraunces', serif;
+  font-style: italic;
+  font-size: 11px;
+  color: var(--teal-strong);
+  letter-spacing: 0;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--teal-soft);
+  border: 1px solid rgba(15, 118, 110, 0.25);
+}
+
 .pop-stat-num {
   font-family: 'Fraunces', serif;
   font-size: 22px;
@@ -140,6 +154,62 @@ main {
   font-size: 12.5px;
   color: var(--muted);
   line-height: 1.5;
+}
+
+/* ---------- Miyo install promo (shown when Miyo isn't connected) ---------- */
+
+.miyo-promo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--teal-soft);
+  border: 1px solid rgba(15, 118, 110, 0.25);
+  color: var(--teal-deep);
+  text-decoration: none;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.1s ease;
+}
+
+.miyo-promo:hover {
+  background: #cfe9e7;
+  border-color: rgba(15, 118, 110, 0.45);
+}
+
+.miyo-promo:active {
+  transform: translateY(1px);
+}
+
+.miyo-promo-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.miyo-promo-text strong {
+  font-family: 'Fraunces', serif;
+  font-weight: 500;
+  font-size: 13px;
+  color: var(--teal-deep);
+  letter-spacing: -0.005em;
+}
+
+.miyo-promo-text span {
+  font-size: 11.5px;
+  color: var(--ink-soft);
+  line-height: 1.35;
+}
+
+.miyo-promo-arrow {
+  font-size: 16px;
+  color: var(--teal-strong);
+  flex-shrink: 0;
 }
 
 /* ---------- Site cards ---------- */
@@ -357,12 +427,110 @@ main {
   flex-wrap: wrap;
 }
 
+.site-hint {
+  margin-top: 8px;
+  font-family: 'Fraunces', serif;
+  font-style: italic;
+  font-size: 10.5px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+/* ---------- Range picker (zip mode) ---------- */
+
+.site-range-row {
+  margin-top: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.site-range-label {
+  font-size: 11.5px;
+  color: var(--ink-soft);
+  font-weight: 500;
+}
+
+.site-range-select,
+.site-range-date {
+  font-family: inherit;
+  font-size: 11.5px;
+  color: var(--ink);
+  background: var(--cream-strong);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 3px 7px;
+  cursor: pointer;
+}
+
+.site-range-select:hover,
+.site-range-date:hover {
+  border-color: rgba(15, 118, 110, 0.4);
+}
+
+.site-range-select:focus,
+.site-range-date:focus {
+  outline: none;
+  border-color: var(--teal-strong);
+  box-shadow: 0 0 0 2px var(--teal-soft);
+}
+
+.site-range-date {
+  font-family: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, monospace;
+}
+
+.site-range-custom {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.site-range-arrow {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .site-actions .link-button {
   margin-left: auto;
 }
 
 .site-actions .link-button + .link-button {
   margin-left: 0;
+}
+
+/* Refresh button keeps the icon and the label inline; nudge gap down
+   so the pair feels like one chip rather than two siblings. */
+.refresh-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.refresh-icon {
+  flex-shrink: 0;
+}
+
+/* Encourage refresh: small red note that sits next to the Refresh
+   button. Markets the count rather than blocking action. */
+.new-items-badge {
+  font-size: 11px;
+  color: var(--danger);
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+/* Positive counterpart to .new-items-badge — shown when the probe
+   confirmed zero new items and the row is otherwise healthy.
+   Quieter than the danger-red "N new" so it doesn't compete for
+   attention with rows that actually need action. */
+.all-captured-badge {
+  font-size: 11px;
+  color: var(--ok);
+  font-weight: 500;
+  letter-spacing: 0;
 }
 
 /* ---------- Status pills ---------- */
