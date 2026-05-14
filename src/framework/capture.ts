@@ -9,11 +9,12 @@
 // Range semantics:
 //   sinceMs   → stop when an item's updated_at falls below it.
 //   untilMs   → skip items above it (newest-first; they're "too new").
-//   sinceMs null → no lower bound. Early-stop kicks in when a page's
-//                  in-range items are all already in the store —
-//                  newest-first ordering means everything below is
-//                  also in store. Without this, "All available" would
-//                  walk the user's entire history on every refresh.
+//   sinceMs null → no lower bound; walk to end-of-pages. "All
+//                  available" is O(library size) in list calls. There
+//                  is no page-level early-stop: a previously bounded
+//                  run (e.g. 30d) leaves older items uncaptured, so a
+//                  "fully-known" page near the top of history would
+//                  hide them. Correctness > a perf shortcut here.
 //
 // Resume:
 //   The capture loop reads pending_run on entry. `cursor` lets us pick
@@ -128,10 +129,6 @@ export async function captureToStore(
     unflushed = 0;
   };
 
-  // Early-stop is only safe when the store is monotonically growing
-  // and we've walked from the top — i.e., sinceMs is null (no lower
-  // bound). Bounded ranges always walk to their lower edge.
-  const earlyStopAllowed = sinceMs === null;
   let firstPageProcessed = false;
 
   const checkStop = async (): Promise<CaptureResult | null> => {
@@ -222,10 +219,6 @@ export async function captureToStore(
 
     if (rangeExhausted) break;
     if (page.next_cursor === null) break;
-    // Newest-first ordering means older pages are also fully in store
-    // once we've seen a fully-known page. Only safe when the run isn't
-    // bounded below — bounded ranges always walk to their lower edge.
-    if (earlyStopAllowed && inRange.length > 0 && missing.length === 0) break;
   }
 
   await flush();
