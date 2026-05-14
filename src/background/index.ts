@@ -1,24 +1,18 @@
 // Service worker entry.
 //
-// Responsibilities, in order of complexity:
+// Responsibilities:
 //
-//   1. Snapshot building. The popup opens a port and asks for a
-//      snapshot; we probe each site's session, try to talk to Miyo,
-//      and (when Miyo answers) compute a per-site delta count. The
-//      whole probe completes in ~1 s and the popup renders once.
+//   1. Snapshot building. The popup asks for a snapshot; we probe
+//      each site's session in parallel and check whether Miyo is
+//      reachable. No per-site Miyo round trips — the popup only
+//      needs connectivity + session, not counts.
 //
 //   2. Capture dispatch. The popup tells us to capture a site in
-//      either 'zip' or 'miyo' mode; we own the run so it survives
-//      popup-close. Progress streams back over the port.
+//      either 'local' or 'miyo' mode; we own the run so it survives
+//      popup-close. Progress streams back over the port. Cancel and
+//      Pause are flags read by the capture loop's shouldStop hook.
 //
 //   3. Badge animation while a run is in flight.
-//
-// What we DO NOT do anymore:
-//   • chrome.alarms keepalive. A 200-item run finishes well inside
-//     the SW idle threshold; if it dies, the cache (zip) or Miyo's
-//     index (Miyo) makes the retry idempotent.
-//   • Folder permissions, destinations, downloads-fallback. All gone.
-//   • Per-site state, sync progress, meta reconciliation. All gone.
 
 import { ADAPTERS, getAdapter } from '../adapters/index.js';
 import { captureToStore } from '../framework/capture.js';
@@ -115,7 +109,7 @@ async function getMiyo(forceProbe = false): Promise<MiyoClient | null> {
     return miyo;
   } catch (err) {
     // Expected for every user without the Miyo desktop app — keep
-    // quiet here, the zip-mode UI is the answer.
+    // quiet here, the local-mode (Download) UI is the answer.
     if (!(err instanceof MiyoUnavailableError)) {
       console.warn('miyo connect failed', err);
     }

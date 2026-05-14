@@ -1,21 +1,23 @@
 // Popup UI.
 //
-// Two modes, mutually exclusive:
+// Both modes share the same card shape: signed-in row → time-range
+// picker + action button. The mode only changes the button label
+// (Capture to Miyo vs Download) and where captured items land:
 //
-//   • Miyo connected: per-site row shows Miyo's count + the delta
-//     available on the site. One primary action: [Send to Miyo].
-//     Miyo is the source of truth.
+//   • Miyo mode: items stream directly into the Miyo desktop app
+//     folder. Pause flushes pending_run for Resume; Stop is hidden
+//     (Discard from the paused state is the way to abandon, so the
+//     bookkeeping doesn't desync from items already POST'd to Miyo).
 //
-//   • Miyo not connected (or not installed): per-site row shows a
-//     time-range picker and a Download button. Capture runs buffer
-//     into IndexedDB; on completion the popup builds a zip from the
-//     buffer and triggers a download, then clears the buffer.
+//   • Local mode: capture runs buffer into IndexedDB; on completion
+//     the popup builds a zip from the buffer and triggers a download,
+//     then clears the buffer. Stop drops the buffer (the buffer *is*
+//     the data, so dropping it is the right "abandon" semantic).
 //
-//     At most one local-mode run can be pending at a time. If a run
-//     is mid-capture or completed-but-not-downloaded, other site
-//     cards are gated until it's resolved (download or discard).
-//     If the SW dies (browser close), the popup shows Resume on
-//     next open and the capture continues without redoing work.
+// At most one run pends across both modes. If a run is mid-capture
+// or completed-but-not-downloaded, other site cards are gated until
+// it's resolved. If the SW dies, the popup shows Resume on next
+// open and the capture continues from the same cursor.
 //
 // Vanilla DOM. No framework — keeps the extension lean.
 

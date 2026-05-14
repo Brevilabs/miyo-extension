@@ -108,8 +108,8 @@ interface BaseSiteAdapter {
   probeSession(): Promise<SiteSession>;
 
   // One page of item refs, sorted newest-first. The framework stops
-  // paging based on its mode (200-cap in zip mode, diff-with-Miyo in
-  // Miyo mode).
+  // paging based on the run's time range, the destination store's
+  // filterMissing result, or end-of-pages (see captureToStore).
   listItems(cursor: string | null): Promise<ItemListPage>;
 }
 

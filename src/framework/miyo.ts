@@ -2,8 +2,8 @@
 //
 // Wire protocol is in docs/MIYO_INTERFACE.md. Miyo desktop binds at
 // 127.0.0.1:8742. The extension probes /v0/health on every popup
-// open with a 1.5s timeout — any failure falls back to local zip mode
-// silently.
+// open with a 1.5s timeout — any failure falls back to local mode
+// (Download → zip) silently.
 //
 // The extension treats Miyo as a content-addressed store. Per-item
 // existence checks go through items/missing (bulk). There is no
@@ -86,8 +86,8 @@ export class MiyoClient {
   }
 
   // Bulk presence check. Returns the subset of itemIds that Miyo
-  // doesn't yet have. Used by the capture loop and by the popup
-  // snapshot's "N new available" probe — one HTTP call per source page.
+  // doesn't yet have. One HTTP call per source page; the capture
+  // loop diffs each list page through this.
   async filterMissing(appId: SiteId, itemIds: string[]): Promise<string[]> {
     if (itemIds.length === 0) return [];
     const result = (await this.request(
