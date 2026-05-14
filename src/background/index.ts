@@ -21,18 +21,15 @@
 //   • Per-site state, sync progress, meta reconciliation. All gone.
 
 import { ADAPTERS, getAdapter } from '../adapters/index.js';
-import { captureToStore, probeStoreDelta } from '../framework/capture.js';
+import { captureToStore } from '../framework/capture.js';
 import { IdbStore, MiyoStore } from '../framework/capture-store.js';
 import type { Store } from '../framework/capture-store.js';
 import { MiyoClient, MiyoUnavailableError } from '../framework/miyo.js';
-import type { AppFolderInfo } from '../framework/miyo.js';
 import { clearItems } from '../framework/store.js';
 import {
   clearPendingRun,
   readPendingRun,
-  readMiyoWatermark,
   updatePendingRun,
-  writeMiyoWatermark,
   writePendingRun,
 } from '../framework/run-state.js';
 import type {
@@ -139,13 +136,7 @@ async function probeSession(adapter: SiteAdapter): Promise<SiteSession> {
   }
 }
 
-// Fast portion of the snapshot: counts + folder path from
-// ensureAppFolder. new_available is left null; the popup fetches
-// it via a separate `deltas` message after this returns.
-async function buildRow(
-  adapter: SiteAdapter,
-  miyoFolder: AppFolderInfo | null
-): Promise<SiteRow> {
+async function buildRow(adapter: SiteAdapter): Promise<SiteRow> {
   const session = await probeSession(adapter);
   return {
     id: adapter.id,
@@ -153,32 +144,13 @@ async function buildRow(
     home_url: adapter.home_url,
     brand_color: adapter.brand_color ?? null,
     session,
-    miyo_total: miyoFolder?.count ?? null,
-    miyo_folder_path: miyoFolder?.folder_path ?? null,
-    new_available: null,
-    new_available_saturated: false,
   };
 }
 
 async function buildSnapshot(): Promise<PopupSnapshot> {
   const client = await getMiyo(true);
-  const miyoFolders = new Map<SiteId, AppFolderInfo>();
-
-  if (client) {
-    await Promise.all(
-      ADAPTERS.map(async (a) => {
-        try {
-          const info = await client.ensureAppFolder(a.id, a.label);
-          miyoFolders.set(a.id, info);
-        } catch {
-          // Tolerate per-source failure — that row shows no Miyo data.
-        }
-      })
-    );
-  }
-
   const [sites, pendingRun] = await Promise.all([
-    Promise.all(ADAPTERS.map((a) => buildRow(a, miyoFolders.get(a.id) ?? null))),
+    Promise.all(ADAPTERS.map((a) => buildRow(a))),
     readPendingRun(),
   ]);
 
@@ -190,32 +162,6 @@ async function buildSnapshot(): Promise<PopupSnapshot> {
 
   void chrome.storage.local.set({ last_snapshot: snapshot });
   return snapshot;
-}
-
-// Per-site delta probe. Up to MAX_PROBE_PAGES rate-limited list-page
-// calls per site (slow — that's why this is split off from buildSnapshot).
-// Returns an empty record if Miyo isn't connected.
-async function probeDeltas(): Promise<
-  Record<SiteId, { count: number; saturated: boolean }>
-> {
-  const client = await getMiyo();
-  if (!client) return {};
-  const out: Record<SiteId, { count: number; saturated: boolean }> = {};
-  await Promise.all(
-    ADAPTERS.map(async (a) => {
-      try {
-        const session = await a.probeSession();
-        if (!session.signedIn) return;
-        const folder = await client.ensureAppFolder(a.id, a.label);
-        const store = new MiyoStore(client, a.id, folder.folder_name);
-        const probe = await probeStoreDelta(a, store);
-        out[a.id] = { count: probe.count, saturated: probe.saturated };
-      } catch {
-        // best-effort; missing entries stay null in the popup
-      }
-    })
-  );
-  return out;
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -264,6 +210,9 @@ interface RunningRun {
   subscribers: Set<chrome.runtime.Port>;
   progress: { phase: 'listing' | 'fetching'; completed: number; total: number | null };
   cancelRequested: boolean;
+  // Soft halt: capture flushes its state and returns aborted/paused;
+  // pending_run is left intact so Resume picks up at the same cursor.
+  pauseRequested: boolean;
 }
 
 let runningRun: RunningRun | null = null;
@@ -283,10 +232,6 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     try {
       if (msg?.type === 'snapshot') {
         sendResponse(await buildSnapshot());
-        return;
-      }
-      if (msg?.type === 'deltas') {
-        sendResponse(await probeDeltas());
         return;
       }
       sendResponse({ error: 'unknown_message' });
@@ -324,6 +269,13 @@ chrome.runtime.onConnect.addListener((port) => {
     if (m.type === 'cancel' && typeof m.site === 'string') {
       if (runningRun && runningRun.siteId === m.site) {
         runningRun.cancelRequested = true;
+      }
+      return;
+    }
+
+    if (m.type === 'pause' && typeof m.site === 'string') {
+      if (runningRun && runningRun.siteId === m.site) {
+        runningRun.pauseRequested = true;
       }
       return;
     }
@@ -440,7 +392,6 @@ chrome.runtime.onConnect.addListener((port) => {
           written: 0,
           errors: 0,
           cursor: null,
-          newest_seen: null,
         });
         range = usedRange;
       }
@@ -456,6 +407,7 @@ chrome.runtime.onConnect.addListener((port) => {
           total: null,
         },
         cancelRequested: false,
+        pauseRequested: false,
       };
       runningRun = entry;
       showBadge(adapter.label);
@@ -483,20 +435,12 @@ chrome.runtime.onConnect.addListener((port) => {
               note,
             });
           },
-          isCancelled: () => entry.cancelRequested,
+          shouldStop: () =>
+            entry.cancelRequested ? 'cancelled' : entry.pauseRequested ? 'paused' : null,
         };
 
         const usedRange: TimeRange = range ?? DEFAULT_TIME_RANGE;
         const { sinceMs, untilMs } = rangeToWindow(usedRange);
-
-        // Watermark only applies to Miyo mode with no lower range
-        // bound — it's the "last successful sync's high water" used
-        // to stop early on incremental syncs. Local mode wipes its
-        // store after each zip, so the concept doesn't apply.
-        const watermark =
-          mode === 'miyo' && sinceMs === null
-            ? await readMiyoWatermark(adapter.id)
-            : null;
 
         let store: Store;
         let result;
@@ -525,7 +469,6 @@ chrome.runtime.onConnect.addListener((port) => {
                 'miyo',
                 sinceMs,
                 untilMs,
-                watermark,
                 callbacks
               );
             }
@@ -538,21 +481,15 @@ chrome.runtime.onConnect.addListener((port) => {
             'local',
             sinceMs,
             untilMs,
-            null,
             callbacks
           );
         }
 
         // 'ready' is the popup's signal to zip+clear (local) or just
         // banner+clear (Miyo). User-Stop wipes everything; other
-        // aborts leave the record paused so the user can Resume.
+        // aborts (paused, miyo_unavailable, etc.) leave the record so
+        // the user can Resume.
         if (result.kind === 'completed') {
-          if (mode === 'miyo') {
-            const run = await readPendingRun();
-            if (run?.newest_seen) {
-              await writeMiyoWatermark(adapter.id, run.newest_seen);
-            }
-          }
           await updatePendingRun({
             status: 'ready',
             written: result.written,

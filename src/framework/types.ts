@@ -54,9 +54,6 @@ export interface PendingRun {
   written: number;
   errors: number;
   cursor: string | null;
-  // Set once on the first page; preserved across resumes. Promoted to
-  // miyo_watermarks on successful Miyo completion only.
-  newest_seen: string | null;
 }
 
 export interface SiteSession {
@@ -162,17 +159,6 @@ export interface SiteRow {
   // Session probe, attempted on popup open. Null = not yet probed.
   session: SiteSession | null;
 
-  // Miyo-mode bookkeeping. Populated when Miyo is connected.
-  // miyo_total: count of items Miyo has stored for this app_id.
-  // miyo_folder_path: absolute on-disk path of the app folder (shown
-  //   in the popup so users know where files land).
-  // new_available: how many items the source has that Miyo doesn't.
-  //   Saturated when our diff probe ran the page cap without finding
-  //   a fully-known page.
-  miyo_total: number | null;
-  miyo_folder_path: string | null;
-  new_available: number | null;
-  new_available_saturated: boolean;
 }
 
 // Background → popup snapshot. Contains everything needed for a
