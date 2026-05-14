@@ -7,10 +7,15 @@
 //     Miyo is the source of truth.
 //
 //   • Miyo not connected (or not installed): per-site row shows a
-//     time-range picker. Single action: [Capture Recent
-//     Conversations] writes each captured item directly to
-//     ~/Downloads/miyo-capture/<site>/<filename>.md. The extension
-//     keeps no per-item state — reruns overwrite cleanly.
+//     time-range picker and a Download button. Capture runs buffer
+//     into IndexedDB; on completion the popup builds a zip from the
+//     buffer and triggers a download, then clears the buffer.
+//
+//     At most one local-mode run can be pending at a time. If a run
+//     is mid-capture or completed-but-not-downloaded, other site
+//     cards are gated until it's resolved (download or discard).
+//     If the SW dies (browser close), the popup shows Resume on
+//     next open and the capture continues without redoing work.
 //
 // Vanilla DOM. No framework — keeps the extension lean.
 
@@ -22,6 +27,9 @@ import type {
   TimeRange,
   TimeRangePreset,
 } from '../framework/types.js';
+import { clearItems, getAllItems } from '../framework/store.js';
+import { clearPendingRun } from '../framework/run-state.js';
+import { buildZip } from '../framework/zip.js';
 
 // ──────────────────────────────────────────────────────────────────
 // Types & state
@@ -50,6 +58,9 @@ interface UIState {
   // updated as the user changes the picker. Sent with the start
   // message so the background applies it.
   ranges: Record<SiteId, TimeRange>;
+  // True while exportPendingAsZip is mid-flight. Used to guard
+  // double-trigger (done broadcast + open-time auto-zip).
+  zipping: boolean;
 }
 
 const ui: UIState = {
@@ -60,6 +71,7 @@ const ui: UIState = {
   capturePort: null,
   banner: null,
   ranges: {},
+  zipping: false,
 };
 
 const RANGES_STORAGE_KEY = 'time_ranges';
@@ -122,27 +134,6 @@ function saveRanges(): void {
 
 function getRange(siteId: SiteId): TimeRange {
   return ui.ranges[siteId] ?? DEFAULT_TIME_RANGE;
-}
-
-function describeRange(range: TimeRange): string {
-  if (range.kind === 'custom') {
-    const sameAsToday = range.untilISODate === todayISODate();
-    return sameAsToday
-      ? `since ${range.sinceISODate}`
-      : `${range.sinceISODate} to ${range.untilISODate}`;
-  }
-  switch (range.preset) {
-    case '24h':
-      return 'the last 24 hours';
-    case '7d':
-      return 'the last 7 days';
-    case '30d':
-      return 'the last 30 days';
-    case '90d':
-      return 'the last 90 days';
-    case 'all':
-      return 'all available history';
-  }
 }
 
 const PRESET_LABELS: Record<TimeRangePreset, string> = {
@@ -292,20 +283,42 @@ function renderSiteRow(s: SiteRow): string {
         ${stopBtn}
       </div>`;
   } else {
-    const range = getRange(s.id);
-    const downloadBtn = isCapturing
-      ? `<button class="link-button link-button-danger" data-action="cancel" data-site="${escape(s.id)}">Stop</button>`
-      : `<button class="primary-button refresh-button site-range-action" data-action="capture-local" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>${DOWNLOAD_ICON}<span>Download</span></button>`;
-    rangeBlock = renderRangePicker(s.id, range, downloadBtn, isCapturing);
+    // Local-mode action depends on the pending-run state for this
+    // site (paused vs idle), or whether some *other* site is the
+    // owner of an in-progress/paused/ready run (gating).
+    const pending = ui.snapshot?.pending_run ?? null;
+    const ownsPending = pending !== null && pending.siteId === s.id;
+    const otherOwnsPending = pending !== null && pending.siteId !== s.id;
+    const isPaused = ownsPending && !isCapturing && pending.status === 'fetching';
+    const range = ownsPending ? pending.range : getRange(s.id);
+
+    let actionHtml: string;
+    if (isCapturing) {
+      actionHtml = `<button class="link-button link-button-danger" data-action="cancel" data-site="${escape(s.id)}">Stop</button>`;
+    } else if (isPaused) {
+      actionHtml = `
+        <button class="primary-button refresh-button site-range-action" data-action="resume" data-site="${escape(s.id)}">${DOWNLOAD_ICON}<span>Resume (${pending.written})</span></button>
+        <button class="link-button link-button-danger" data-action="discard" data-site="${escape(s.id)}">Discard</button>`;
+    } else if (otherOwnsPending) {
+      actionHtml = `<button class="primary-button refresh-button site-range-action" disabled>${DOWNLOAD_ICON}<span>Download</span></button>`;
+    } else {
+      actionHtml = `<button class="primary-button refresh-button site-range-action" data-action="capture-local" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>${DOWNLOAD_ICON}<span>Download</span></button>`;
+    }
+    rangeBlock = renderRangePicker(s.id, range, actionHtml, isCapturing || isPaused);
   }
 
   const progress = isCapturing ? renderProgress() : '';
 
-  // Local-mode footnote: where files land. Drop the per-run cap
-  // mention — there's no cap now.
+  // Local-mode footnote. When a pending run exists on a *different*
+  // site, surface the gating reason so the disabled Download button
+  // isn't a mystery.
+  const pending = ui.snapshot?.pending_run ?? null;
+  const otherOwnsPending = pending !== null && pending.siteId !== s.id;
   const localHint =
     !miyoMode && s.session?.signedIn
-      ? `<div class="site-hint">Newest first within your range. Files land in Downloads/miyo-capture/${escape(s.id)}/.</div>`
+      ? otherOwnsPending
+        ? `<div class="site-hint">A capture from ${escape(pending.siteId)} is pending — resolve it before starting a new one.</div>`
+        : `<div class="site-hint">Newest first within your range. Bundled into one .zip when finished.</div>`
       : '';
 
   return `
@@ -443,6 +456,8 @@ function render(): void {
       if (action === 'capture-local' && site) void onCapture(site, 'local');
       else if (action === 'capture-miyo' && site) void onCapture(site, 'miyo');
       else if (action === 'cancel' && site) onCancel(site);
+      else if (action === 'resume') void onResume();
+      else if (action === 'discard') void onDiscard();
       else if (action === 'open-site' && site) onOpenSite(site);
     });
   });
@@ -535,9 +550,103 @@ function onCancel(siteId: SiteId): void {
   ui.capturePort?.postMessage({ type: 'cancel', site: siteId });
 }
 
+function onResume(): void {
+  ui.banner = null;
+  const pending = ui.snapshot?.pending_run ?? null;
+  if (!pending) return;
+  ui.capturing = pending.siteId;
+  ui.captureProgress = {
+    phase: 'fetching',
+    completed: pending.written,
+    total: null,
+  };
+  const port = chrome.runtime.connect({ name: 'capture' });
+  ui.capturePort = port;
+  render();
+  port.postMessage({ type: 'resume' });
+  wirePort(port, pending.siteId);
+}
+
+async function onDiscard(): Promise<void> {
+  const pending = ui.snapshot?.pending_run ?? null;
+  if (!pending) return;
+  // Local-first wipe so a slow message round-trip can't leave a
+  // pending run visible after the user discarded it.
+  try {
+    await clearItems(pending.siteId);
+  } catch {
+    // best-effort
+  }
+  await clearPendingRun();
+  // Tell SW too, in case a stale runningRun is hanging around.
+  try {
+    const port = chrome.runtime.connect({ name: 'capture' });
+    port.postMessage({ type: 'discard' });
+    port.disconnect();
+  } catch {
+    // ignore
+  }
+  void refresh();
+}
+
 function onOpenSite(siteId: SiteId): void {
   const site = findSite(siteId);
   if (site) void chrome.tabs.create({ url: site.home_url });
+}
+
+// Build the zip from IDB contents for the given site, trigger a
+// browser download via <a download>, then wipe items + pending_run.
+//
+// Single-shot: called on the 'done' broadcast when capture completes,
+// AND on popup open when pending_run.status === 'completed' (covers
+// the case where the popup was closed at completion). Guarded against
+// running twice via the ui.zipping flag.
+async function exportPendingAsZip(siteId: SiteId): Promise<void> {
+  if (ui.zipping) return;
+  ui.zipping = true;
+  ui.banner = { kind: 'info', text: 'Preparing zip…' };
+  render();
+  try {
+    const records = await getAllItems(siteId);
+    if (records.length === 0) {
+      // Nothing to zip — wipe the dangling record and bail.
+      await clearPendingRun();
+      ui.banner = { kind: 'info', text: 'Nothing to download.' };
+      ui.zipping = false;
+      void refresh();
+      return;
+    }
+    const files = records.map((r) => ({ filename: r.filename, content: r.markdown }));
+    const blob = buildZip(files);
+    const stamp = new Date().toISOString().slice(0, 10);
+    const zipName = `miyo-capture-${siteId}-${stamp}.zip`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = zipName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    // Defer revocation so the download has time to start.
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+
+    // Only clear after the download was initiated successfully.
+    await clearItems(siteId);
+    await clearPendingRun();
+
+    ui.banner = {
+      kind: 'info',
+      text: `Downloaded ${files.length} conversation${files.length === 1 ? '' : 's'} as ${zipName}.`,
+    };
+  } catch (err) {
+    ui.banner = {
+      kind: 'error',
+      text: `Failed to build zip: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  } finally {
+    ui.zipping = false;
+    void refresh();
+  }
 }
 
 function wirePort(port: chrome.runtime.Port, siteId: SiteId): void {
@@ -565,6 +674,7 @@ function wirePort(port: chrome.runtime.Port, siteId: SiteId): void {
       ui.capturing = null;
       ui.captureProgress = null;
       ui.capturePort = null;
+      port.disconnect();
       if (done.result.kind === 'completed') {
         const { written, errors, mode } = done.result;
         if (mode === 'miyo') {
@@ -577,28 +687,17 @@ function wirePort(port: chrome.runtime.Port, siteId: SiteId): void {
                   ? `Sent ${written} to Miyo (${errors} failed).`
                   : `Sent ${written} to Miyo.`,
           };
-        } else if (written > 0) {
-          const rangeDesc = describeRange(getRange(done.site));
-          let text = `Saved ${written} from ${rangeDesc} to Downloads/miyo-capture/${done.site}/`;
-          if (errors > 0) text += ` (${errors} failed)`;
-          text += '.';
-          ui.banner = { kind: 'info', text };
+          void refresh();
         } else {
-          const rangeDesc = describeRange(getRange(done.site));
-          ui.banner = {
-            kind: 'info',
-            text:
-              errors > 0
-                ? `Capture finished with ${errors} error${errors === 1 ? '' : 's'}.`
-                : `Nothing in ${rangeDesc} to capture.`,
-          };
+          // Local mode completed → SW marked pending_run as 'completed'.
+          // Build the zip from IDB now.
+          void exportPendingAsZip(done.site);
         }
       } else {
         const kind = done.result.reason === 'cancelled' ? 'info' : 'error';
         ui.banner = { kind, text: explainAbort(done.result.reason) };
+        void refresh();
       }
-      port.disconnect();
-      void refresh();
     }
   });
   port.onDisconnect.addListener(() => {
@@ -619,6 +718,10 @@ function explainAbort(reason: string): string {
       return 'You are signed out. Sign in and try again.';
     case 'busy':
       return 'Another capture is already running.';
+    case 'pending_run_exists':
+      return 'A previous capture is pending — resolve it first.';
+    case 'no_pending_run':
+      return 'No pending capture to resume.';
     case 'miyo_unavailable':
       return 'Lost connection to Miyo. Reopen the popup to retry.';
     default:
@@ -697,6 +800,14 @@ async function init(): Promise<void> {
   } finally {
     ui.initializing = false;
     render();
+  }
+
+  // If a local capture finished while the popup was closed, the SW
+  // marked pending_run as 'completed' but nobody has built the zip
+  // yet. Do it now.
+  const pending = ui.snapshot?.pending_run;
+  if (pending && pending.status === 'completed' && !ui.zipping) {
+    void exportPendingAsZip(pending.siteId);
   }
 }
 

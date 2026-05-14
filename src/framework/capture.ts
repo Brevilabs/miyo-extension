@@ -1,15 +1,16 @@
 // Capture orchestrator.
 //
-// Two flows share the inner loop (paged list → fetch+render → write)
-// but differ at the edges:
+// Two flows:
 //
 //   captureToLocalFiles (local mode — Miyo not installed)
-//     • User picks a time-range window; we capture newest-first
-//       within it, up to a MAX_ZIP_ITEMS safety cap.
-//     • Each rendered item is written directly to the user's
-//       Downloads folder via chrome.downloads.download (one .md per
-//       item, conflictAction:'overwrite'). The filesystem is the
-//       source of truth; the extension stores no per-item state.
+//     • User picks a time-range window. We page newest-first and
+//       buffer each rendered item into IndexedDB (store.ts). When
+//       the loop finishes we mark the pending run 'completed'; the
+//       popup then zips IDB contents and triggers the download.
+//     • Resumable across browser restarts: items already in IDB are
+//       skipped at the fetch step. The persistent run record
+//       (run-state.ts) tells the popup whether to show "Resume" or
+//       auto-zip-and-download on its next open.
 //
 //   captureToMiyo (Miyo mode)
 //     • No cap. Miyo holds the full library; the extension only sends
@@ -19,11 +20,10 @@
 //     • POSTs each rendered item as a .md file via /v0/file, and
 //       updates the metadata blob (every FLUSH_EVERY items + at end).
 //
-// Neither flow persists run progress. If the SW dies, the next click
-// starts fresh:
-//   • Local mode: re-running captures into the same paths; overwrite
-//     makes the retry safely idempotent. Any items downloaded before
-//     the death survive on disk.
+// If the SW dies mid-run:
+//   • Local mode: items written so far survive in IDB; pending_run
+//     record stays at status='fetching'. Next popup open offers
+//     Resume, which re-enters the loop and skips IDB-present items.
 //   • Miyo mode: the metadata blob (last flushed) is the index. Items
 //     written but not yet recorded in metadata get re-captured next
 //     run (POST /v0/file with force:true is idempotent), so worst-case
@@ -31,7 +31,8 @@
 
 import { FatalError, paced } from './rate-limit.js';
 import { renderChatConversationMarkdown } from './chat.js';
-import { downloadMarkdown } from './downloader.js';
+import { hasItem, putItem } from './store.js';
+import { updatePendingRun } from './run-state.js';
 import { makeDatePrefixedFilename } from './filename.js';
 import { MiyoClient, MiyoUnavailableError } from './miyo.js';
 import type {
@@ -135,20 +136,24 @@ export async function captureToLocalFiles(
   adapter: SiteAdapter,
   sinceMs: number | null,
   untilMs: number | null,
+  initialWritten: number,
+  initialErrors: number,
   callbacks: CaptureCallbacks
 ): Promise<CaptureResult> {
   const session = await adapter.probeSession();
   if (!session.signedIn) return { kind: 'aborted', reason: 'signed_out' };
 
-  // Page-and-download in lockstep: each list page immediately drives
-  // downloads, so the user sees files flowing into Downloads almost
-  // as soon as the run starts (no separate "scanning" phase to sit
-  // through). The whole thing is naturally bounded by the user's
-  // range — items below sinceMs end the scan, items above untilMs are
-  // skipped (newest-first ordering).
+  // Page-and-buffer in lockstep: each list page immediately drives
+  // IDB writes, so a resumed run sees progress without re-traversing
+  // the entire window. Items below sinceMs end the scan; items above
+  // untilMs are skipped (newest-first ordering).
+  //
+  // initialWritten/initialErrors let a resumed run continue counting
+  // from where the previous attempt left off (read from the persisted
+  // PendingRun by the caller).
   let listCursor: string | null = null;
-  let written = 0;
-  let errors = 0;
+  let written = initialWritten;
+  let errors = initialErrors;
 
   while (true) {
     if (callbacks.isCancelled?.()) return { kind: 'aborted', reason: 'cancelled' };
@@ -169,13 +174,20 @@ export async function captureToLocalFiles(
         rangeExhausted = true;
         break;
       }
+      // Resume short-circuit: items already buffered survive across
+      // SW death and browser restarts. We just count them and move on.
+      if (await hasItem(adapter.id, item.id)) {
+        continue;
+      }
       try {
         const captured = await paced(adapter.id, () => renderForAdapter(adapter, item));
-        await downloadMarkdown(adapter.id, captured);
+        await putItem(adapter.id, captured);
         written += 1;
+        await updatePendingRun({ written, errors });
       } catch (err) {
         if (isSignedOutError(err)) return { kind: 'aborted', reason: 'signed_out' };
         errors += 1;
+        await updatePendingRun({ written, errors });
       }
       // Total is unknown without an upfront listing pass — popup
       // shows an indeterminate bar plus the running count.

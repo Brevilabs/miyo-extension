@@ -28,6 +28,13 @@ import {
   probeMiyoDelta,
 } from '../framework/capture.js';
 import { MiyoClient, MiyoUnavailableError } from '../framework/miyo.js';
+import { clearItems } from '../framework/store.js';
+import {
+  clearPendingRun,
+  readPendingRun,
+  updatePendingRun,
+  writePendingRun,
+} from '../framework/run-state.js';
 import type {
   PopupSnapshot,
   SiteAdapter,
@@ -197,13 +204,15 @@ async function buildSnapshot(): Promise<PopupSnapshot> {
     );
   }
 
-  const sites = await Promise.all(
-    ADAPTERS.map((a) => buildRow(a, miyoIndices?.get(a.id) ?? null))
-  );
+  const [sites, pendingRun] = await Promise.all([
+    Promise.all(ADAPTERS.map((a) => buildRow(a, miyoIndices?.get(a.id) ?? null))),
+    readPendingRun(),
+  ]);
 
   const snapshot: PopupSnapshot = {
     miyo_connected: client !== null,
     sites,
+    pending_run: pendingRun,
   };
 
   // Cache for stale-while-revalidate in the popup. Best-effort —
@@ -330,6 +339,22 @@ chrome.runtime.onConnect.addListener((port) => {
       return;
     }
 
+    if (m.type === 'discard') {
+      // Used by the popup to clean up after a paused or completed
+      // local run that the user dropped — wipes items + record.
+      void (async () => {
+        if (runningRun?.mode === 'local') {
+          runningRun.cancelRequested = true;
+        }
+        const run = await readPendingRun();
+        if (run) {
+          await clearItems(run.siteId);
+          await clearPendingRun();
+        }
+      })();
+      return;
+    }
+
     if (m.type === 'attach' && typeof m.site === 'string') {
       if (runningRun && runningRun.siteId === m.site) {
         runningRun.subscribers.add(port);
@@ -346,53 +371,115 @@ chrome.runtime.onConnect.addListener((port) => {
       return;
     }
 
-    if (m.type !== 'start' || typeof m.site !== 'string') return;
-    if (m.mode !== 'local' && m.mode !== 'miyo') return;
-
-    const adapter = getAdapter(m.site);
-    if (!adapter) {
-      safePost({
-        type: 'done',
-        site: m.site,
-        result: { kind: 'aborted', reason: 'unknown_site' },
-      });
-      return;
-    }
-
-    // Reattach if this site is already running.
-    if (runningRun && runningRun.siteId === adapter.id) {
-      runningRun.subscribers.add(port);
-      safePost({
-        type: 'progress',
-        site: adapter.id,
-        phase: runningRun.progress.phase,
-        completed: runningRun.progress.completed,
-        total: runningRun.progress.total,
-      });
-      return;
-    }
-
-    if (runningRun) {
-      safePost({
-        type: 'done',
-        site: adapter.id,
-        result: { kind: 'aborted', reason: 'busy' },
-      });
-      return;
-    }
-
-    const entry: RunningRun = {
-      siteId: adapter.id,
-      mode: m.mode,
-      subscribers: new Set([port]),
-      progress: { phase: 'listing', completed: 0, total: null },
-      cancelRequested: false,
-    };
-    runningRun = entry;
-    showBadge(adapter.label);
-    void setActiveRunMirror(adapter.id);
+    const isStart = m.type === 'start' && typeof m.site === 'string';
+    const isResume = m.type === 'resume';
+    if (!isStart && !isResume) return;
 
     void (async () => {
+      let siteId: SiteId;
+      let mode: 'local' | 'miyo';
+      let range: TimeRange | null;
+      let initialWritten = 0;
+      let initialErrors = 0;
+
+      if (isResume) {
+        const run = await readPendingRun();
+        if (!run) {
+          safePost({
+            type: 'done',
+            site: '',
+            result: { kind: 'aborted', reason: 'no_pending_run' },
+          });
+          return;
+        }
+        siteId = run.siteId;
+        mode = 'local';
+        range = run.range;
+        initialWritten = run.written;
+        initialErrors = run.errors;
+        // Bump status back to 'fetching' on resume.
+        await writePendingRun({ ...run, status: 'fetching' });
+      } else {
+        if (m.mode !== 'local' && m.mode !== 'miyo') return;
+        siteId = m.site as SiteId;
+        mode = m.mode;
+        range = m.range ?? null;
+      }
+
+      const adapter = getAdapter(siteId);
+      if (!adapter) {
+        safePost({
+          type: 'done',
+          site: siteId,
+          result: { kind: 'aborted', reason: 'unknown_site' },
+        });
+        return;
+      }
+
+      // Reattach if this site is already running.
+      if (runningRun && runningRun.siteId === adapter.id) {
+        runningRun.subscribers.add(port);
+        safePost({
+          type: 'progress',
+          site: adapter.id,
+          phase: runningRun.progress.phase,
+          completed: runningRun.progress.completed,
+          total: runningRun.progress.total,
+        });
+        return;
+      }
+
+      if (runningRun) {
+        safePost({
+          type: 'done',
+          site: adapter.id,
+          result: { kind: 'aborted', reason: 'busy' },
+        });
+        return;
+      }
+
+      // For a fresh local-mode start: reject if a pending run already
+      // exists (paused/completed). The popup is responsible for
+      // surfacing that and asking the user to resolve.
+      if (mode === 'local' && !isResume) {
+        const existing = await readPendingRun();
+        if (existing) {
+          safePost({
+            type: 'done',
+            site: adapter.id,
+            result: { kind: 'aborted', reason: 'pending_run_exists' },
+          });
+          return;
+        }
+        // Write the fresh run record up front so a SW death at any
+        // point leaves a recoverable state.
+        const usedRange: TimeRange = range ?? DEFAULT_TIME_RANGE;
+        await writePendingRun({
+          siteId: adapter.id,
+          range: usedRange,
+          started_at: Date.now(),
+          status: 'fetching',
+          written: 0,
+          errors: 0,
+        });
+        range = usedRange;
+      }
+
+      const entry: RunningRun = {
+        siteId: adapter.id,
+        mode,
+        subscribers: new Set([port]),
+        progress: {
+          phase: 'listing',
+          completed: initialWritten,
+          total: null,
+        },
+        cancelRequested: false,
+      };
+      runningRun = entry;
+      showBadge(adapter.label);
+      void setActiveRunMirror(adapter.id);
+
       try {
         const callbacks = {
           onProgress: ({
@@ -417,7 +504,7 @@ chrome.runtime.onConnect.addListener((port) => {
         };
 
         let result;
-        if (m.mode === 'miyo') {
+        if (mode === 'miyo') {
           const client = await getMiyo();
           if (!client) {
             result = { kind: 'aborted' as const, reason: 'miyo_unavailable' };
@@ -425,10 +512,35 @@ chrome.runtime.onConnect.addListener((port) => {
             result = await captureToMiyo(adapter, client, callbacks);
           }
         } else {
-          const range: TimeRange = m.range ?? DEFAULT_TIME_RANGE;
-          const { sinceMs, untilMs } = rangeToWindow(range);
-          result = await captureToLocalFiles(adapter, sinceMs, untilMs, callbacks);
+          const usedRange: TimeRange = range ?? DEFAULT_TIME_RANGE;
+          const { sinceMs, untilMs } = rangeToWindow(usedRange);
+          result = await captureToLocalFiles(
+            adapter,
+            sinceMs,
+            untilMs,
+            initialWritten,
+            initialErrors,
+            callbacks
+          );
         }
+
+        // Local-mode post-run bookkeeping. Completion → mark
+        // 'completed' (popup will zip + clear). User cancellation
+        // → wipe items + record. Other aborts → leave the record
+        // alone so the user can resume later (still 'fetching').
+        if (mode === 'local') {
+          if (result.kind === 'completed') {
+            await updatePendingRun({
+              status: 'completed',
+              written: result.written,
+              errors: result.errors,
+            });
+          } else if (result.reason === 'cancelled') {
+            await clearItems(adapter.id);
+            await clearPendingRun();
+          }
+        }
+
         broadcast(entry, { type: 'done', site: adapter.id, result });
       } catch (err) {
         broadcast(entry, {

@@ -29,6 +29,25 @@ export type TimeRange =
 
 export const DEFAULT_TIME_RANGE: TimeRange = { kind: 'preset', preset: '30d' };
 
+// At most one local-mode capture runs at a time. The record lives in
+// chrome.storage.local so it survives browser restarts — the actual
+// captured items live in IndexedDB (see framework/store.ts).
+//
+// Lifecycle:
+//   fetching  → SW is (or was) capturing. If SW isn't running it
+//               now, the run is "paused"; the popup offers Resume.
+//   completed → capture loop finished. The popup zips IDB contents
+//               and triggers a download, then clears both the
+//               record and the IDB items.
+export interface PendingRun {
+  siteId: SiteId;
+  range: TimeRange;
+  started_at: number; // epoch ms
+  status: 'fetching' | 'completed';
+  written: number;
+  errors: number;
+}
+
 export interface SiteSession {
   signedIn: boolean;
   email: string | null;
@@ -175,4 +194,9 @@ export interface SiteRow {
 export interface PopupSnapshot {
   miyo_connected: boolean;
   sites: SiteRow[];
+  // The single in-flight or completed-but-not-downloaded local-mode
+  // run, if any. Drives popup decisions: which card shows Resume,
+  // whether to auto-zip on open, whether to gate other sites'
+  // Download buttons.
+  pending_run: PendingRun | null;
 }
