@@ -13,6 +13,10 @@ import type { ChatConversation } from './chat.js';
 
 export type SiteId = string;
 
+// Capture destination: 'local' buffers to IDB and zips at the end;
+// 'miyo' streams items directly into the Miyo desktop app folder.
+export type CaptureMode = 'local' | 'miyo';
+
 // Zip-mode capture range. Two shapes:
 //   • Preset: a now-relative window. The upper bound is implicit
 //     "now"; the lower bound is preset-defined. 'all' means no lower
@@ -33,39 +37,25 @@ export const DEFAULT_TIME_RANGE: TimeRange = { kind: 'preset', preset: '30d' };
 // chrome.storage.local so it survives browser restarts — the actual
 // captured items live in IndexedDB (see framework/store.ts).
 //
-// One persistent record covers both local and Miyo runs.
+// `capturing` covers both in-flight (SW running) and paused (SW
+// killed); the popup distinguishes by whether the SW reports an
+// in-flight run. `ready` is the popup's cue to finalize: local
+// zips IDB, Miyo just clears the record.
 //
-// Lifecycle:
-//   capturing → SW is (or was) capturing. If SW isn't running it
-//               now, the run is "paused"; the popup offers Resume.
-//   ready     → capture loop finished. In local mode the popup
-//               zips IDB contents and triggers a download. In Miyo
-//               mode files are already on disk in Miyo's app
-//               folder — the popup just shows a completion banner.
-//               Either way, status='ready' triggers cleanup of
-//               this record (and IDB items, in local mode).
-//
-// `cursor` is the source-adapter's last-seen list cursor. Saving it
-// per page lets resume after a crash skip pages we already walked,
-// which matters when sinceMs is null (otherwise the loop could
-// re-walk a 10k-item history).
-//
-// `mode` distinguishes local (zip-at-end) vs miyo (files already
-// landed) so the done-handler knows what to do at ready.
+// `cursor` lets resume skip pages already walked — important for
+// the "All available" + huge-history case where re-walking the
+// whole source would take many minutes.
 export interface PendingRun {
   siteId: SiteId;
-  mode: 'local' | 'miyo';
+  mode: CaptureMode;
   range: TimeRange;
   started_at: number; // epoch ms
   status: 'capturing' | 'ready';
   written: number;
   errors: number;
   cursor: string | null;
-  // ISO updated_at of the newest item seen on this run's first page.
-  // Set once at the very start of the run; preserved across resumes
-  // so an aborted-then-resumed run still records the right value.
-  // On successful Miyo completion, copied to miyo_watermarks so the
-  // next sync can stop early at this boundary.
+  // Set once on the first page; preserved across resumes. Promoted to
+  // miyo_watermarks on successful Miyo completion only.
   newest_seen: string | null;
 }
 
@@ -159,34 +149,6 @@ export interface CapturedItem {
   // message_count, tags, author, etc. that don't fit the common
   // envelope. Currently unused by the framework; reserved.
   extra?: Record<string, unknown>;
-}
-
-// What the extension stores in Miyo's app-folder metadata blob.
-// Schema is extension-owned; Miyo treats this as opaque JSON. See
-// docs/MIYO_INTERFACE.md §5.
-//
-// `items` is the authoritative answer to "what has been captured":
-// reading it tells the extension the count, the watermark, and
-// whether any given item id needs re-capture (by comparing
-// `updated_at`).
-//
-// `app_id` here is the source application — "chatgpt", "claude_ai",
-// etc. — not the extension. The extension is just the orchestrator;
-// Miyo stores one app folder per captured source.
-export interface AppFolderMetadata {
-  version: 1;
-  app_id: SiteId;
-  label: string;
-  last_sync_at: string | null;
-  items: Record<string, AppFolderMetadataItem>;
-}
-
-export interface AppFolderMetadataItem {
-  updated_at: string;
-  filename: string;
-  title: string;
-  url: string;
-  created_at: string | null;
 }
 
 // What the popup needs to render one site card. Built freshly on

@@ -26,13 +26,18 @@ import { renderChatConversationMarkdown } from './chat.js';
 import { readPendingRun, updatePendingRun } from './run-state.js';
 import { makeDatePrefixedFilename } from './filename.js';
 import { MiyoUnavailableError } from './miyo.js';
-import type { CapturedItem, ListItem, RenderedItem, SiteAdapter } from './types.js';
+import type {
+  CaptureMode,
+  CapturedItem,
+  ListItem,
+  RenderedItem,
+  SiteAdapter,
+} from './types.js';
 import type { Store } from './capture-store.js';
 
-// pending_run.{written,errors,cursor} are flushed every N captured
-// items. A crash loses at most N items of bookkeeping; the IDB / Miyo
-// store always reflects truth via filterMissing, so resume corrects
-// the count on its first flush.
+// Crash loses at most this many items of bookkeeping; the store
+// itself is the source of truth via filterMissing, so resume self-
+// corrects on its first flush.
 const RUN_FLUSH_EVERY = 10;
 
 export interface CaptureCallbacks {
@@ -40,17 +45,13 @@ export interface CaptureCallbacks {
     phase: 'listing' | 'fetching';
     completed: number;
     total: number | null;
-    // Optional override for the popup's progress text. The capture
-    // loop sends this at moments where a generic phase label isn't
-    // specific enough — e.g. "Found 3 new on page 1, fetching…"
-    // right after the first filterMissing call lands.
     note?: string;
   }) => void;
   isCancelled?: () => boolean;
 }
 
 export type CaptureResult =
-  | { kind: 'completed'; mode: 'local' | 'miyo'; written: number; errors: number }
+  | { kind: 'completed'; mode: CaptureMode; written: number; errors: number }
   | { kind: 'aborted'; reason: string };
 
 async function renderForAdapter(
@@ -98,7 +99,7 @@ function errMessage(err: unknown): string {
 export async function captureToStore(
   adapter: SiteAdapter,
   store: Store,
-  mode: 'local' | 'miyo',
+  mode: CaptureMode,
   sinceMs: number | null,
   untilMs: number | null,
   // Stop scanning the moment we see an item with updated_at <= this.
@@ -150,18 +151,13 @@ export async function captureToStore(
       return { kind: 'aborted', reason: errMessage(err) };
     }
 
-    // Capture the newest item's updated_at the first time we see one
-    // — preserved across resumes via pending_run. On successful Miyo
-    // completion this becomes the new watermark.
+    // Preserved across resumes via pending_run; on successful Miyo
+    // completion it becomes the next sync's watermark.
     if (newestSeen === null && page.items.length > 0) {
       newestSeen = page.items[0]!.updated_at;
       unflushed += 1;
     }
 
-    // Filter to in-range items, and detect whether we've crossed
-    // below sinceMs (rangeExhausted) or hit the prior-sync watermark.
-    // The watermark check is what lets a steady-state sync finish
-    // after one list call: items below it are known to be in store.
     const inRange: ListItem[] = [];
     let rangeExhausted = false;
     let belowWatermark = false;
@@ -193,9 +189,9 @@ export async function captureToStore(
     }
     const missingSet = new Set(missing);
 
-    // First-page feedback: tell the popup what we found so the
-    // "Looking for new conversations…" text gets a concrete update
-    // before the first item fetch finishes (~1.5s of additional wait).
+    // Concrete first-page note so the popup isn't stuck on the
+    // generic "Looking for new conversations…" through the first
+    // ~1.5s item fetch.
     if (!firstPageProcessed && missing.length > 0) {
       callbacks.onProgress({
         phase: 'listing',
@@ -239,9 +235,8 @@ export async function captureToStore(
     if (rangeExhausted) break;
     if (belowWatermark) break;
     if (page.next_cursor === null) break;
-    // Early stop: a non-empty page where every in-range item was
-    // already in the store. Newest-first ordering means older pages
-    // are also fully in store.
+    // Newest-first ordering means older pages are also fully in store
+    // once we've seen a fully-known page.
     if (earlyStopAllowed && inRange.length > 0 && missing.length === 0) break;
   }
 

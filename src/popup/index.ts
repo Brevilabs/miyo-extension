@@ -21,6 +21,7 @@
 
 import { DEFAULT_TIME_RANGE } from '../framework/types.js';
 import type {
+  CaptureMode,
   PopupSnapshot,
   SiteId,
   SiteRow,
@@ -39,7 +40,7 @@ type CaptureDone = {
   type: 'done';
   site: SiteId;
   result:
-    | { kind: 'completed'; mode: 'local' | 'miyo'; written: number; errors: number }
+    | { kind: 'completed'; mode: CaptureMode; written: number; errors: number }
     | { kind: 'aborted'; reason: string };
 };
 
@@ -55,27 +56,17 @@ interface UIState {
   } | null;
   capturePort: chrome.runtime.Port | null;
   banner: { kind: 'info' | 'error'; text: string } | null;
-  // Per-site capture range. Loaded from chrome.storage.local on init,
-  // updated as the user changes the picker. Sent with the start
-  // message so the background applies it.
   ranges: Record<SiteId, TimeRange>;
-  // True while exportPendingAsZip is mid-flight. Used to guard
-  // double-trigger (done broadcast + open-time auto-zip).
+  // Guards exportPendingAsZip against double-trigger (done broadcast
+  // + open-time auto-zip both arriving).
   zipping: boolean;
-  // True while the fast probe (health + ensureAppFolder) is in
-  // flight. Drives the "Checking Miyo…" header chip. Resolves quickly
-  // — Miyo connected state shows up as soon as the fast snapshot
-  // lands, without waiting for the slow per-site delta probe.
+  // Fast probe in flight — drives the header "Checking Miyo…" chip.
   probingMiyo: boolean;
-  // True while the slow per-site delta probe is in flight. Drives
-  // the "checking new…" badge inside each Miyo card. Resolves on its
-  // own clock, independent of probingMiyo.
+  // Slow per-site delta probe in flight — drives per-card "checking
+  // new…" badges. Resolves independently of probingMiyo.
   probingDeltas: boolean;
-  // User preference: should the popup show Miyo UI when Miyo is
-  // available? Default true. Persisted in chrome.storage.local
-  // under 'miyo_enabled'. Toggling off makes the popup behave as if
-  // Miyo isn't there (local mode UI), even though the SW keeps
-  // probing health in the background.
+  // User preference; toggling off makes the popup behave as local-
+  // mode even when Miyo desktop is reachable.
   miyoEnabled: boolean;
 }
 
@@ -587,7 +578,7 @@ function onRangeCustomDateChange(
 // Actions
 // ──────────────────────────────────────────────────────────────────
 
-function onCapture(siteId: SiteId, mode: 'local' | 'miyo'): void {
+function onCapture(siteId: SiteId, mode: CaptureMode): void {
   ui.banner = null;
   ui.capturing = siteId;
   ui.captureProgress = { phase: 'listing', completed: 0, total: null };
@@ -883,10 +874,16 @@ async function init(): Promise<void> {
     render();
   }
 
-  // Capture completed while the popup was closed: zip + clear now.
+  // Capture completed while the popup was closed. For local mode, zip
+  // + clear; for Miyo mode, files are already on the Miyo server, so
+  // just clear the pending_run record and refresh.
   const pending = ui.snapshot?.pending_run;
   if (pending && pending.status === 'ready' && !ui.zipping) {
-    void exportPendingAsZip(pending.siteId);
+    if (pending.mode === 'miyo') {
+      void clearPendingRun().then(() => refresh());
+    } else {
+      void exportPendingAsZip(pending.siteId);
+    }
   }
 
   // Slow per-site delta probe, run after the header chip has flipped

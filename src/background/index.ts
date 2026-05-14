@@ -36,6 +36,7 @@ import {
   writePendingRun,
 } from '../framework/run-state.js';
 import type {
+  CaptureMode,
   PopupSnapshot,
   SiteAdapter,
   SiteId,
@@ -138,10 +139,9 @@ async function probeSession(adapter: SiteAdapter): Promise<SiteSession> {
   }
 }
 
-// Build a row WITHOUT the slow per-site delta probe. miyo_total +
-// folder_path come from the cheap ensureAppFolder call; new_available
-// is left null and the popup fills it in via a separate `deltas`
-// message once the slow probe resolves.
+// Fast portion of the snapshot: counts + folder path from
+// ensureAppFolder. new_available is left null; the popup fetches
+// it via a separate `deltas` message after this returns.
 async function buildRow(
   adapter: SiteAdapter,
   miyoFolder: AppFolderInfo | null
@@ -260,7 +260,7 @@ clearBadge();
 
 interface RunningRun {
   siteId: SiteId;
-  mode: 'local' | 'miyo';
+  mode: CaptureMode;
   subscribers: Set<chrome.runtime.Port>;
   progress: { phase: 'listing' | 'fetching'; completed: number; total: number | null };
   cancelRequested: boolean;
@@ -317,7 +317,7 @@ chrome.runtime.onConnect.addListener((port) => {
     const m = msg as {
       type?: string;
       site?: string;
-      mode?: 'local' | 'miyo';
+      mode?: CaptureMode;
       range?: TimeRange;
     };
 
@@ -364,7 +364,7 @@ chrome.runtime.onConnect.addListener((port) => {
 
     void (async () => {
       let siteId: SiteId;
-      let mode: 'local' | 'miyo';
+      let mode: CaptureMode;
       let range: TimeRange | null;
 
       if (isResume) {
@@ -420,9 +420,6 @@ chrome.runtime.onConnect.addListener((port) => {
         return;
       }
 
-      // Fresh start (not resume): refuse if any pending run already
-      // exists. The popup is responsible for surfacing that and asking
-      // the user to resolve (resume/discard/download).
       if (!isResume) {
         const existing = await readPendingRun();
         if (existing) {
@@ -546,13 +543,9 @@ chrome.runtime.onConnect.addListener((port) => {
           );
         }
 
-        // Completion → status='ready'. Local: popup will zip + clear.
-        // Miyo: files are already on disk; popup just shows banner +
-        // clears the record. Also advance the Miyo watermark so the
-        // next sync stops at this run's boundary instead of walking
-        // pages it already covered.
-        // Cancellation → wipe items + record. Other aborts → leave
-        // paused so the user can Resume.
+        // 'ready' is the popup's signal to zip+clear (local) or just
+        // banner+clear (Miyo). User-Stop wipes everything; other
+        // aborts leave the record paused so the user can Resume.
         if (result.kind === 'completed') {
           if (mode === 'miyo') {
             const run = await readPendingRun();

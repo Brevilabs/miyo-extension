@@ -39,13 +39,9 @@ export async function updatePendingRun(
   return next;
 }
 
-// Per-site Miyo sync watermark: the ISO updated_at at the top of the
-// source list when our last successful Miyo sync started. Items
-// above this on a future sync may need capture; items at or below it
-// are known to be in Miyo, so the scan can stop there. Only updated
-// when a Miyo run completes successfully — aborted/cancelled runs
-// leave the prior watermark in place.
-
+// Items at or below this updated_at were captured by a prior
+// successful sync, so the next scan can stop there. Only advanced on
+// successful completion — aborts leave the prior value intact.
 export async function readMiyoWatermark(siteId: SiteId): Promise<string | null> {
   try {
     const obj = await chrome.storage.local.get(WATERMARKS_KEY);

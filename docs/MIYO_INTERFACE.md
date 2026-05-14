@@ -13,18 +13,11 @@ metadata blob on Miyo's side.
 ## 1. Conceptual model
 
 An **app folder** is a logical destination addressed by a stable
-`app_id` (e.g. `"chatgpt"`, `"claude_ai"`). Miyo backs each app
-folder with a real on-disk folder, but the extension addresses it
-only by `app_id`. The on-disk `folder_path` is returned to the
-extension so it can be shown to the user (and the user may relocate
-it later via Miyo itself).
-
-| | App folder |
-|---|---|
-| On-disk location | Miyo picks initially; user may relocate via Miyo |
-| Addressed externally by | `app_id` (stable) |
-| Contents | Captured by the extension; one .md per item |
-| Per-item index | Owned by Miyo, keyed by `(app_id, item_id)` |
+`app_id` (e.g. `"chatgpt"`, `"claude_ai"`). Miyo picks the on-disk
+folder for it initially and indexes its contents by `(app_id, item_id)`;
+the extension only ever addresses it by `app_id`. The on-disk
+`folder_path` is returned so the popup can show users where files
+landed; users may relocate it later via Miyo itself.
 
 ---
 
@@ -181,14 +174,3 @@ relies entirely on `items/missing`: items already written survive
 across browser restarts and SW deaths, and the next run skips them
 via the bulk check.
 
----
-
-## 5. Notes on file-content versioning
-
-The current design does *not* re-fetch items that have changed
-upstream after capture. `items/missing` answers existence only,
-not freshness. Chat conversations grow append-only in practice, so
-the missed-update case is rare. If you ever need "refresh truly
-modified items", extend `items/missing` to take
-`{ item_id, updated_at }` pairs and return ids whose stored
-`updated_at` is older.

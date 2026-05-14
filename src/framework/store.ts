@@ -10,9 +10,10 @@
 // finishes, the popup reads everything for a siteId, zips it up, and
 // downloads. After the user has the zip, we clear the store.
 //
-// Resume: capture.ts checks hasItem before fetching each list item.
-// A browser close mid-run leaves items in IDB; the next Resume just
-// picks up where the loop left off without refetching.
+// Resume: capture.ts diffs each page against IdbStore.filterMissing
+// (which bulk-loads existing ids via getAllItemIds). A browser close
+// mid-run leaves items in IDB; the next Resume picks up where the
+// loop left off without refetching anything already on disk.
 
 import type { CapturedItem, SiteId } from './types.js';
 
@@ -143,6 +144,16 @@ export async function getAllItems(siteId: SiteId): Promise<ItemRecord[]> {
   return withStore('readonly', async (store) => {
     const range = IDBKeyRange.bound([siteId], [siteId, []]);
     return reqToPromise(store.getAll(range));
+  });
+}
+
+// Returns just the item_id portion of every key for this site. One
+// transaction; caller wraps in a Set for O(1) membership.
+export async function getAllItemIds(siteId: SiteId): Promise<string[]> {
+  return withStore('readonly', async (store) => {
+    const range = IDBKeyRange.bound([siteId], [siteId, []]);
+    const keys = await reqToPromise(store.getAllKeys(range));
+    return keys.map((k) => (k as [SiteId, string])[1]);
   });
 }
 
