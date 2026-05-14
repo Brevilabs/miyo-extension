@@ -271,17 +271,6 @@ interface RunningRun {
 }
 
 let runningRun: RunningRun | null = null;
-const ACTIVE_RUN_KEY = 'active_run';
-
-async function setActiveRunMirror(siteId: SiteId | null): Promise<void> {
-  if (siteId === null) {
-    await chrome.storage.local.remove(ACTIVE_RUN_KEY);
-  } else {
-    await chrome.storage.local.set({
-      [ACTIVE_RUN_KEY]: { site: siteId, started_at: Date.now() },
-    });
-  }
-}
 
 function broadcast(entry: RunningRun, msg: unknown): void {
   for (const port of entry.subscribers) {
@@ -340,8 +329,6 @@ chrome.runtime.onConnect.addListener((port) => {
     }
 
     if (m.type === 'discard') {
-      // Used by the popup to clean up after a paused or completed
-      // local run that the user dropped — wipes items + record.
       void (async () => {
         if (runningRun?.mode === 'local') {
           runningRun.cancelRequested = true;
@@ -379,8 +366,6 @@ chrome.runtime.onConnect.addListener((port) => {
       let siteId: SiteId;
       let mode: 'local' | 'miyo';
       let range: TimeRange | null;
-      let initialWritten = 0;
-      let initialErrors = 0;
 
       if (isResume) {
         const run = await readPendingRun();
@@ -395,10 +380,7 @@ chrome.runtime.onConnect.addListener((port) => {
         siteId = run.siteId;
         mode = 'local';
         range = run.range;
-        initialWritten = run.written;
-        initialErrors = run.errors;
-        // Bump status back to 'fetching' on resume.
-        await writePendingRun({ ...run, status: 'fetching' });
+        await writePendingRun({ ...run, status: 'capturing' });
       } else {
         if (m.mode !== 'local' && m.mode !== 'miyo') return;
         siteId = m.site as SiteId;
@@ -438,9 +420,6 @@ chrome.runtime.onConnect.addListener((port) => {
         return;
       }
 
-      // For a fresh local-mode start: reject if a pending run already
-      // exists (paused/completed). The popup is responsible for
-      // surfacing that and asking the user to resolve.
       if (mode === 'local' && !isResume) {
         const existing = await readPendingRun();
         if (existing) {
@@ -451,34 +430,32 @@ chrome.runtime.onConnect.addListener((port) => {
           });
           return;
         }
-        // Write the fresh run record up front so a SW death at any
-        // point leaves a recoverable state.
         const usedRange: TimeRange = range ?? DEFAULT_TIME_RANGE;
         await writePendingRun({
           siteId: adapter.id,
           range: usedRange,
           started_at: Date.now(),
-          status: 'fetching',
+          status: 'capturing',
           written: 0,
           errors: 0,
         });
         range = usedRange;
       }
 
+      const resumeFrom = isResume ? (await readPendingRun())?.written ?? 0 : 0;
       const entry: RunningRun = {
         siteId: adapter.id,
         mode,
         subscribers: new Set([port]),
         progress: {
           phase: 'listing',
-          completed: initialWritten,
+          completed: resumeFrom,
           total: null,
         },
         cancelRequested: false,
       };
       runningRun = entry;
       showBadge(adapter.label);
-      void setActiveRunMirror(adapter.id);
 
       try {
         const callbacks = {
@@ -514,24 +491,16 @@ chrome.runtime.onConnect.addListener((port) => {
         } else {
           const usedRange: TimeRange = range ?? DEFAULT_TIME_RANGE;
           const { sinceMs, untilMs } = rangeToWindow(usedRange);
-          result = await captureToLocalFiles(
-            adapter,
-            sinceMs,
-            untilMs,
-            initialWritten,
-            initialErrors,
-            callbacks
-          );
+          result = await captureToLocalFiles(adapter, sinceMs, untilMs, callbacks);
         }
 
-        // Local-mode post-run bookkeeping. Completion → mark
-        // 'completed' (popup will zip + clear). User cancellation
-        // → wipe items + record. Other aborts → leave the record
-        // alone so the user can resume later (still 'fetching').
+        // Completion → 'ready' (popup will zip + clear). Cancellation
+        // → wipe items + record. Other aborts → leave paused for
+        // user retry.
         if (mode === 'local') {
           if (result.kind === 'completed') {
             await updatePendingRun({
-              status: 'completed',
+              status: 'ready',
               written: result.written,
               errors: result.errors,
             });
@@ -554,7 +523,6 @@ chrome.runtime.onConnect.addListener((port) => {
       } finally {
         if (runningRun === entry) runningRun = null;
         clearBadge();
-        await setActiveRunMirror(null);
       }
     })();
   });

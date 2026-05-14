@@ -32,7 +32,7 @@
 import { FatalError, paced } from './rate-limit.js';
 import { renderChatConversationMarkdown } from './chat.js';
 import { hasItem, putItem } from './store.js';
-import { updatePendingRun } from './run-state.js';
+import { readPendingRun, updatePendingRun } from './run-state.js';
 import { makeDatePrefixedFilename } from './filename.js';
 import { MiyoClient, MiyoUnavailableError } from './miyo.js';
 import type {
@@ -43,6 +43,12 @@ import type {
   RenderedItem,
   SiteAdapter,
 } from './types.js';
+
+// pending_run.{written,errors} are flushed to chrome.storage.local
+// every N captured items, not per item — the storage write per item
+// was visible overhead and the displayed count drifts by at most
+// N-1 on a crash, which the IDB index recovers transparently.
+const RUN_FLUSH_EVERY = 10;
 
 // Miyo-mode metadata-flush cadence. Trade-off: a higher number means
 // fewer PUTs but more redo on SW death. 25 items × ~1.5s rate-limited
@@ -136,38 +142,46 @@ export async function captureToLocalFiles(
   adapter: SiteAdapter,
   sinceMs: number | null,
   untilMs: number | null,
-  initialWritten: number,
-  initialErrors: number,
   callbacks: CaptureCallbacks
 ): Promise<CaptureResult> {
   const session = await adapter.probeSession();
   if (!session.signedIn) return { kind: 'aborted', reason: 'signed_out' };
 
-  // Page-and-buffer in lockstep: each list page immediately drives
-  // IDB writes, so a resumed run sees progress without re-traversing
-  // the entire window. Items below sinceMs end the scan; items above
-  // untilMs are skipped (newest-first ordering).
-  //
-  // initialWritten/initialErrors let a resumed run continue counting
-  // from where the previous attempt left off (read from the persisted
-  // PendingRun by the caller).
+  // Counters resume from the persisted run — the caller is responsible
+  // for having written the PendingRun record (status='capturing')
+  // before invoking us. A first run sees written/errors at 0.
+  const existing = await readPendingRun();
+  let written = existing?.written ?? 0;
+  let errors = existing?.errors ?? 0;
+  let unflushed = 0;
+  const flush = async (): Promise<void> => {
+    if (unflushed === 0) return;
+    await updatePendingRun({ written, errors });
+    unflushed = 0;
+  };
+
   let listCursor: string | null = null;
-  let written = initialWritten;
-  let errors = initialErrors;
 
   while (true) {
-    if (callbacks.isCancelled?.()) return { kind: 'aborted', reason: 'cancelled' };
+    if (callbacks.isCancelled?.()) {
+      await flush();
+      return { kind: 'aborted', reason: 'cancelled' };
+    }
     let page;
     try {
       page = await paced(adapter.id, () => adapter.listItems(listCursor));
     } catch (err) {
+      await flush();
       if (isSignedOutError(err)) return { kind: 'aborted', reason: 'signed_out' };
       return { kind: 'aborted', reason: errMessage(err) };
     }
 
     let rangeExhausted = false;
     for (const item of page.items) {
-      if (callbacks.isCancelled?.()) return { kind: 'aborted', reason: 'cancelled' };
+      if (callbacks.isCancelled?.()) {
+        await flush();
+        return { kind: 'aborted', reason: 'cancelled' };
+      }
       const ts = Date.parse(item.updated_at);
       if (untilMs !== null && ts >= untilMs) continue; // too new — skip
       if (sinceMs !== null && ts < sinceMs) {
@@ -175,22 +189,21 @@ export async function captureToLocalFiles(
         break;
       }
       // Resume short-circuit: items already buffered survive across
-      // SW death and browser restarts. We just count them and move on.
-      if (await hasItem(adapter.id, item.id)) {
-        continue;
-      }
+      // SW death and browser restarts.
+      if (await hasItem(adapter.id, item.id)) continue;
       try {
         const captured = await paced(adapter.id, () => renderForAdapter(adapter, item));
         await putItem(adapter.id, captured);
         written += 1;
-        await updatePendingRun({ written, errors });
       } catch (err) {
-        if (isSignedOutError(err)) return { kind: 'aborted', reason: 'signed_out' };
+        if (isSignedOutError(err)) {
+          await flush();
+          return { kind: 'aborted', reason: 'signed_out' };
+        }
         errors += 1;
-        await updatePendingRun({ written, errors });
       }
-      // Total is unknown without an upfront listing pass — popup
-      // shows an indeterminate bar plus the running count.
+      unflushed += 1;
+      if (unflushed >= RUN_FLUSH_EVERY) await flush();
       callbacks.onProgress({ phase: 'fetching', completed: written, total: null });
     }
 
@@ -199,6 +212,7 @@ export async function captureToLocalFiles(
     listCursor = page.next_cursor;
   }
 
+  await flush();
   return { kind: 'completed', mode: 'local', written, errors };
 }
 

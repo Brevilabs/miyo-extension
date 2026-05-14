@@ -34,6 +34,32 @@ interface ItemRecord {
 // upgrade handler ran the createObjectStore call, the DB sits at some
 // version with no store. We detect that, close, and reopen at
 // current+1 to force a fresh upgrade.
+// Module-level cached connection. Keeps the capture hot loop from
+// opening + closing a connection per IDB call (every hasItem / putItem
+// otherwise pays two open round-trips).
+let dbPromise: Promise<IDBDatabase> | null = null;
+
+function getDb(): Promise<IDBDatabase> {
+  if (dbPromise) return dbPromise;
+  dbPromise = openDb().then((db) => {
+    // If the connection becomes invalid (Chrome triggered a version
+    // upgrade from another context, or DB was deleted), drop the
+    // cache so the next call re-opens.
+    db.onclose = () => {
+      dbPromise = null;
+    };
+    db.onversionchange = () => {
+      db.close();
+      dbPromise = null;
+    };
+    return db;
+  });
+  dbPromise.catch(() => {
+    dbPromise = null;
+  });
+  return dbPromise;
+}
+
 function openDb(): Promise<IDBDatabase> {
   return openAtVersion(undefined).then((db) => {
     if (db.objectStoreNames.contains(ITEMS_STORE)) return db;
@@ -65,20 +91,16 @@ async function withStore<T>(
   mode: IDBTransactionMode,
   fn: (store: IDBObjectStore) => Promise<T>
 ): Promise<T> {
-  const db = await openDb();
-  try {
-    const tx = db.transaction(ITEMS_STORE, mode);
-    const store = tx.objectStore(ITEMS_STORE);
-    const result = await fn(store);
-    await new Promise<void>((resolve, reject) => {
-      tx.oncomplete = () => resolve();
-      tx.onabort = () => reject(tx.error);
-      tx.onerror = () => reject(tx.error);
-    });
-    return result;
-  } finally {
-    db.close();
-  }
+  const db = await getDb();
+  const tx = db.transaction(ITEMS_STORE, mode);
+  const store = tx.objectStore(ITEMS_STORE);
+  const result = await fn(store);
+  await new Promise<void>((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error);
+    tx.onerror = () => reject(tx.error);
+  });
+  return result;
 }
 
 function reqToPromise<T>(req: IDBRequest<T>): Promise<T> {

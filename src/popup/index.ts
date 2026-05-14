@@ -289,7 +289,7 @@ function renderSiteRow(s: SiteRow): string {
     const pending = ui.snapshot?.pending_run ?? null;
     const ownsPending = pending !== null && pending.siteId === s.id;
     const otherOwnsPending = pending !== null && pending.siteId !== s.id;
-    const isPaused = ownsPending && !isCapturing && pending.status === 'fetching';
+    const isPaused = ownsPending && !isCapturing && pending.status === 'capturing';
     const range = ownsPending ? pending.range : getRange(s.id);
 
     let actionHtml: string;
@@ -567,18 +567,9 @@ function onResume(): void {
   wirePort(port, pending.siteId);
 }
 
-async function onDiscard(): Promise<void> {
-  const pending = ui.snapshot?.pending_run ?? null;
-  if (!pending) return;
-  // Local-first wipe so a slow message round-trip can't leave a
-  // pending run visible after the user discarded it.
-  try {
-    await clearItems(pending.siteId);
-  } catch {
-    // best-effort
-  }
-  await clearPendingRun();
-  // Tell SW too, in case a stale runningRun is hanging around.
+function onDiscard(): void {
+  // The SW owns cleanup — it can also stop a running capture loop
+  // (cancelRequested) which the popup can't.
   try {
     const port = chrome.runtime.connect({ name: 'capture' });
     port.postMessage({ type: 'discard' });
@@ -586,7 +577,8 @@ async function onDiscard(): Promise<void> {
   } catch {
     // ignore
   }
-  void refresh();
+  // Small delay so the next snapshot reads the cleared state.
+  setTimeout(() => void refresh(), 150);
 }
 
 function onOpenSite(siteId: SiteId): void {
@@ -594,13 +586,8 @@ function onOpenSite(siteId: SiteId): void {
   if (site) void chrome.tabs.create({ url: site.home_url });
 }
 
-// Build the zip from IDB contents for the given site, trigger a
-// browser download via <a download>, then wipe items + pending_run.
-//
-// Single-shot: called on the 'done' broadcast when capture completes,
-// AND on popup open when pending_run.status === 'completed' (covers
-// the case where the popup was closed at completion). Guarded against
-// running twice via the ui.zipping flag.
+// Single-shot guarded by ui.zipping — fired both on 'done' and on
+// popup-open when status is 'ready' (covers popup-closed-at-completion).
 async function exportPendingAsZip(siteId: SiteId): Promise<void> {
   if (ui.zipping) return;
   ui.zipping = true;
@@ -609,7 +596,6 @@ async function exportPendingAsZip(siteId: SiteId): Promise<void> {
   try {
     const records = await getAllItems(siteId);
     if (records.length === 0) {
-      // Nothing to zip — wipe the dangling record and bail.
       await clearPendingRun();
       ui.banner = { kind: 'info', text: 'Nothing to download.' };
       ui.zipping = false;
@@ -618,8 +604,7 @@ async function exportPendingAsZip(siteId: SiteId): Promise<void> {
     }
     const files = records.map((r) => ({ filename: r.filename, content: r.markdown }));
     const blob = buildZip(files);
-    const stamp = new Date().toISOString().slice(0, 10);
-    const zipName = `miyo-capture-${siteId}-${stamp}.zip`;
+    const zipName = `miyo-capture-${siteId}-${todayISODate()}.zip`;
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -665,7 +650,6 @@ function wirePort(port: chrome.runtime.Port, siteId: SiteId): void {
       ui.captureProgress = null;
       ui.capturePort = null;
       port.disconnect();
-      void chrome.storage.local.remove('active_run');
       void refresh();
       return;
     }
@@ -689,8 +673,6 @@ function wirePort(port: chrome.runtime.Port, siteId: SiteId): void {
           };
           void refresh();
         } else {
-          // Local mode completed → SW marked pending_run as 'completed'.
-          // Build the zip from IDB now.
           void exportPendingAsZip(done.site);
         }
       } else {
@@ -729,12 +711,6 @@ function explainAbort(reason: string): string {
   }
 }
 
-async function getActiveRunSite(): Promise<SiteId | null> {
-  const obj = await chrome.storage.local.get('active_run');
-  const entry = obj.active_run as { site?: string } | undefined;
-  return (entry?.site as SiteId | undefined) ?? null;
-}
-
 function attachToRunningRun(siteId: SiteId): void {
   ui.capturing = siteId;
   ui.captureProgress = { phase: 'listing', completed: 0, total: null };
@@ -770,30 +746,26 @@ async function loadCachedSnapshot(): Promise<PopupSnapshot | null> {
 async function init(): Promise<void> {
   render();
 
-  // Load persisted ranges in parallel with the cached snapshot. Both
-  // are storage.local reads (~5 ms each) so they pipeline well.
   const [cached, ranges] = await Promise.all([loadCachedSnapshot(), loadRanges()]);
   ui.ranges = ranges;
   if (cached) {
     ui.snapshot = cached;
     ui.initializing = false;
     render();
+    // Attach to any in-flight capture without blocking the fresh probe.
+    // If the SW isn't actually running it (paused), it replies
+    // 'not_running' and the popup flips to the paused render.
+    if (cached.pending_run?.status === 'capturing' && ui.capturing === null) {
+      attachToRunningRun(cached.pending_run.siteId);
+    }
   }
 
-  // Attach to any in-flight capture without blocking the fresh probe.
-  void getActiveRunSite().then((active) => {
-    if (active && ui.capturing !== active) attachToRunningRun(active);
-  });
-
-  // Fire the fresh snapshot. Don't await before painting — the cached
-  // render is already up. When this resolves, update and re-render.
   try {
     const snapshot = (await chrome.runtime.sendMessage({
       type: 'snapshot',
     })) as PopupSnapshot;
     ui.snapshot = snapshot;
   } catch (err) {
-    // Only surface the error if we had nothing cached to show.
     if (!cached) {
       ui.banner = { kind: 'error', text: err instanceof Error ? err.message : String(err) };
     }
@@ -802,11 +774,9 @@ async function init(): Promise<void> {
     render();
   }
 
-  // If a local capture finished while the popup was closed, the SW
-  // marked pending_run as 'completed' but nobody has built the zip
-  // yet. Do it now.
+  // Capture completed while the popup was closed: zip + clear now.
   const pending = ui.snapshot?.pending_run;
-  if (pending && pending.status === 'completed' && !ui.zipping) {
+  if (pending && pending.status === 'ready' && !ui.zipping) {
     void exportPendingAsZip(pending.siteId);
   }
 }

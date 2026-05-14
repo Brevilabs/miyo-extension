@@ -34,16 +34,16 @@ export const DEFAULT_TIME_RANGE: TimeRange = { kind: 'preset', preset: '30d' };
 // captured items live in IndexedDB (see framework/store.ts).
 //
 // Lifecycle:
-//   fetching  → SW is (or was) capturing. If SW isn't running it
+//   capturing → SW is (or was) capturing. If SW isn't running it
 //               now, the run is "paused"; the popup offers Resume.
-//   completed → capture loop finished. The popup zips IDB contents
+//   ready     → capture loop finished. The popup zips IDB contents
 //               and triggers a download, then clears both the
 //               record and the IDB items.
 export interface PendingRun {
   siteId: SiteId;
   range: TimeRange;
   started_at: number; // epoch ms
-  status: 'fetching' | 'completed';
+  status: 'capturing' | 'ready';
   written: number;
   errors: number;
 }
