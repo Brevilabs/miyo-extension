@@ -129,10 +129,10 @@ export async function captureToStore(
   let errors = existing?.errors ?? 0;
   let listCursor: string | null = existing?.cursor ?? null;
   let unflushed = 0;
-  // The most recent title we successfully captured. Surfaced as a
+  // The most recent item we successfully captured. Surfaced as a
   // detail line so the user sees what's being saved, not just a
   // count.
-  let lastCapturedTitle: string | null = null;
+  let lastCaptured: { title: string; updatedAt: string } | null = null;
 
   const flush = async (): Promise<void> => {
     if (unflushed === 0) return;
@@ -229,7 +229,7 @@ export async function captureToStore(
         const captured = await paced(adapter.id, () => renderForAdapter(adapter, item));
         await store.put(captured);
         written += 1;
-        lastCapturedTitle = captured.title;
+        lastCaptured = { title: captured.title, updatedAt: captured.updated_at };
       } catch (err) {
         if (isSignedOutError(err)) {
           await flush();
@@ -247,8 +247,8 @@ export async function captureToStore(
         phase: 'fetching',
         completed: written,
         total: null,
-        note: lastCapturedTitle
-          ? `${written} captured · ${lastCapturedTitle}`
+        note: lastCaptured
+          ? `${written} captured · ${formatDate(lastCaptured.updatedAt)} · ${lastCaptured.title}`
           : undefined,
       });
     }
