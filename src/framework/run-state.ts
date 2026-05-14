@@ -6,10 +6,9 @@
 // popup needs it on the synchronous-feeling open path; storage.local
 // reads are typically <5 ms.
 
-import type { PendingRun, SiteId } from './types.js';
+import type { PendingRun } from './types.js';
 
 const KEY = 'pending_run';
-const WATERMARKS_KEY = 'miyo_watermarks';
 
 export async function readPendingRun(): Promise<PendingRun | null> {
   try {
@@ -37,27 +36,4 @@ export async function updatePendingRun(
   const next: PendingRun = { ...current, ...patch };
   await writePendingRun(next);
   return next;
-}
-
-// Items at or below this updated_at were captured by a prior
-// successful sync, so the next scan can stop there. Only advanced on
-// successful completion — aborts leave the prior value intact.
-export async function readMiyoWatermark(siteId: SiteId): Promise<string | null> {
-  try {
-    const obj = await chrome.storage.local.get(WATERMARKS_KEY);
-    const all = obj[WATERMARKS_KEY] as Record<string, string> | undefined;
-    return all?.[siteId] ?? null;
-  } catch {
-    return null;
-  }
-}
-
-export async function writeMiyoWatermark(
-  siteId: SiteId,
-  updatedAt: string
-): Promise<void> {
-  const obj = await chrome.storage.local.get(WATERMARKS_KEY);
-  const all = (obj[WATERMARKS_KEY] as Record<string, string> | undefined) ?? {};
-  all[siteId] = updatedAt;
-  await chrome.storage.local.set({ [WATERMARKS_KEY]: all });
 }

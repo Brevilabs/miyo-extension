@@ -40,6 +40,11 @@ import type { Store } from './capture-store.js';
 // corrects on its first flush.
 const RUN_FLUSH_EVERY = 10;
 
+// 'cancelled' is the hard halt — pending_run is dropped. 'paused' is
+// the soft one — state is flushed and Resume picks up at the same
+// cursor.
+export type StopReason = 'cancelled' | 'paused';
+
 export interface CaptureCallbacks {
   onProgress: (p: {
     phase: 'listing' | 'fetching';
@@ -47,7 +52,7 @@ export interface CaptureCallbacks {
     total: number | null;
     note?: string;
   }) => void;
-  isCancelled?: () => boolean;
+  shouldStop?: () => StopReason | null;
 }
 
 export type CaptureResult =
@@ -102,12 +107,6 @@ export async function captureToStore(
   mode: CaptureMode,
   sinceMs: number | null,
   untilMs: number | null,
-  // Stop scanning the moment we see an item with updated_at <= this.
-  // Items strictly above it still pass through filterMissing so
-  // "bumped" known items don't get falsely re-captured. Pass null for
-  // a full walk (first sync, or local mode where this concept doesn't
-  // apply).
-  watermark: string | null,
   callbacks: CaptureCallbacks
 ): Promise<CaptureResult> {
   const session = await adapter.probeSession();
@@ -117,7 +116,6 @@ export async function captureToStore(
   let written = existing?.written ?? 0;
   let errors = existing?.errors ?? 0;
   let listCursor: string | null = existing?.cursor ?? null;
-  let newestSeen: string | null = existing?.newest_seen ?? null;
   let unflushed = 0;
 
   const flush = async (): Promise<void> => {
@@ -126,7 +124,6 @@ export async function captureToStore(
       written,
       errors,
       cursor: listCursor,
-      newest_seen: newestSeen,
     });
     unflushed = 0;
   };
@@ -137,11 +134,16 @@ export async function captureToStore(
   const earlyStopAllowed = sinceMs === null;
   let firstPageProcessed = false;
 
+  const checkStop = async (): Promise<CaptureResult | null> => {
+    const stop = callbacks.shouldStop?.();
+    if (!stop) return null;
+    await flush();
+    return { kind: 'aborted', reason: stop };
+  };
+
   while (true) {
-    if (callbacks.isCancelled?.()) {
-      await flush();
-      return { kind: 'aborted', reason: 'cancelled' };
-    }
+    const stop = await checkStop();
+    if (stop) return stop;
     let page;
     try {
       page = await paced(adapter.id, () => adapter.listItems(listCursor));
@@ -151,25 +153,13 @@ export async function captureToStore(
       return { kind: 'aborted', reason: errMessage(err) };
     }
 
-    // Preserved across resumes via pending_run; on successful Miyo
-    // completion it becomes the next sync's watermark.
-    if (newestSeen === null && page.items.length > 0) {
-      newestSeen = page.items[0]!.updated_at;
-      unflushed += 1;
-    }
-
     const inRange: ListItem[] = [];
     let rangeExhausted = false;
-    let belowWatermark = false;
     for (const item of page.items) {
       const ts = Date.parse(item.updated_at);
       if (untilMs !== null && ts >= untilMs) continue;
       if (sinceMs !== null && ts < sinceMs) {
         rangeExhausted = true;
-        break;
-      }
-      if (watermark !== null && item.updated_at <= watermark) {
-        belowWatermark = true;
         break;
       }
       inRange.push(item);
@@ -204,10 +194,8 @@ export async function captureToStore(
 
     for (const item of inRange) {
       if (!missingSet.has(item.id)) continue;
-      if (callbacks.isCancelled?.()) {
-        await flush();
-        return { kind: 'aborted', reason: 'cancelled' };
-      }
+      const stop = await checkStop();
+      if (stop) return stop;
       try {
         const captured = await paced(adapter.id, () => renderForAdapter(adapter, item));
         await store.put(captured);
@@ -233,36 +221,13 @@ export async function captureToStore(
     if (unflushed >= RUN_FLUSH_EVERY) await flush();
 
     if (rangeExhausted) break;
-    if (belowWatermark) break;
     if (page.next_cursor === null) break;
     // Newest-first ordering means older pages are also fully in store
-    // once we've seen a fully-known page.
+    // once we've seen a fully-known page. Only safe when the run isn't
+    // bounded below — bounded ranges always walk to their lower edge.
     if (earlyStopAllowed && inRange.length > 0 && missing.length === 0) break;
   }
 
   await flush();
   return { kind: 'completed', mode, written, errors };
-}
-
-// Probe-only: walk a few pages newest-first asking the store how
-// many items are missing. Used by the popup snapshot's "N new
-// available" indicator (Miyo mode only).
-const MAX_PROBE_PAGES = 4;
-
-export async function probeStoreDelta(
-  adapter: SiteAdapter,
-  store: Store
-): Promise<{ count: number; saturated: boolean }> {
-  let count = 0;
-  let cursor: string | null = null;
-  for (let page = 0; page < MAX_PROBE_PAGES; page++) {
-    const result = await paced(adapter.id, () => adapter.listItems(cursor));
-    if (result.items.length === 0) return { count, saturated: false };
-    const missing = await store.filterMissing(result.items.map((i) => i.id));
-    count += missing.length;
-    if (missing.length === 0) return { count, saturated: false };
-    if (result.next_cursor === null) return { count, saturated: false };
-    cursor = result.next_cursor;
-  }
-  return { count, saturated: true };
 }
