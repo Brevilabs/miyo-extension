@@ -235,7 +235,7 @@ function renderProgress(): string {
   if (note) {
     text = note;
   } else if (phase === 'listing') {
-    text = 'Looking for new conversations…';
+    text = 'Checking your conversations…';
   } else {
     text = total ? `${completed} of ${total}` : `${completed} captured`;
     determinate = total !== null && total > 0;

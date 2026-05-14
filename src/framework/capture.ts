@@ -118,6 +118,11 @@ export async function captureToStore(
   let errors = existing?.errors ?? 0;
   let listCursor: string | null = existing?.cursor ?? null;
   let unflushed = 0;
+  // Running count of in-range items seen across all pages so the
+  // popup can show "Checked N conversations…" while filterMissing
+  // walks page after page. Important on unbounded ("all") syncs
+  // where most pages may have nothing new.
+  let scanned = 0;
 
   const flush = async (): Promise<void> => {
     if (unflushed === 0) return;
@@ -176,15 +181,25 @@ export async function captureToStore(
     }
     const missingSet = new Set(missing);
 
-    // Concrete first-page note so the popup isn't stuck on the
-    // generic "Looking for new conversations…" through the first
-    // ~1.5s item fetch.
+    // Surface scan progress page-by-page so the popup isn't stuck on
+    // "Looking for new conversations…" for an entire library walk.
+    // On the first page with new items, switch to "Found N new,
+    // fetching…" so the user knows fetching is about to start.
+    scanned += inRange.length;
     if (!firstPageProcessed && missing.length > 0) {
       callbacks.onProgress({
         phase: 'listing',
         completed: 0,
         total: null,
         note: `Found ${missing.length} new, fetching…`,
+      });
+    } else {
+      const target = mode === 'miyo' ? 'Miyo' : 'your local cache';
+      callbacks.onProgress({
+        phase: 'listing',
+        completed: 0,
+        total: null,
+        note: `Checked ${scanned.toLocaleString()} conversations against ${target}…`,
       });
     }
     firstPageProcessed = true;
