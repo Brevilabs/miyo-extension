@@ -4,16 +4,16 @@
 //
 //   • Miyo connected: per-site row shows Miyo's count + the delta
 //     available on the site. One primary action: [Send to Miyo].
-//     Miyo is the source of truth; no local cache is used.
+//     Miyo is the source of truth.
 //
-//   • Miyo not connected (or not installed): per-site row shows the
-//     local cache size. Two actions: [Capture] (refresh the cache)
-//     and [Export ZIP] (download whatever's in the cache).
+//   • Miyo not connected (or not installed): per-site row shows a
+//     time-range picker. Single action: [Capture Recent
+//     Conversations] writes each captured item directly to
+//     ~/Downloads/miyo-capture/<site>/<filename>.md. The extension
+//     keeps no per-item state — reruns overwrite cleanly.
 //
 // Vanilla DOM. No framework — keeps the extension lean.
 
-import { getCache } from '../framework/cache.js';
-import { buildZip } from '../framework/zip.js';
 import { DEFAULT_TIME_RANGE } from '../framework/types.js';
 import type {
   PopupSnapshot,
@@ -31,13 +31,7 @@ type CaptureDone = {
   type: 'done';
   site: SiteId;
   result:
-    | {
-        kind: 'completed';
-        mode: 'zip' | 'miyo';
-        written: number;
-        errors: number;
-        saturated?: boolean;
-      }
+    | { kind: 'completed'; mode: 'local' | 'miyo'; written: number; errors: number }
     | { kind: 'aborted'; reason: string };
 };
 
@@ -249,7 +243,10 @@ function renderSiteRow(s: SiteRow): string {
       ? `<span class="site-account">not signed in</span>`
       : '';
 
-  // Body line: differs by mode.
+  // Body line: only Miyo mode has a meaningful per-site count to
+  // surface (Miyo's total + new-available delta). Local mode keeps
+  // no state, so we leave the body line empty there — the picker
+  // and hint below carry the relevant context.
   let bodyLine = '';
   if (miyoMode) {
     const total = s.miyo_total;
@@ -266,21 +263,19 @@ function renderSiteRow(s: SiteRow): string {
       newStr = ` · <span class="all-captured-badge">✓ all captured</span>`;
     }
     bodyLine = `<div class="site-counts">${totalStr}${newStr}</div>`;
-  } else {
-    const cached = s.cached_count;
-    const cachedStr =
-      cached !== null && cached > 0
-        ? `<strong>${cached}</strong> cached locally`
-        : 'no captures yet';
-    bodyLine = `<div class="site-counts">${cachedStr}</div>`;
   }
 
-  // Actions.
-  const actions: string[] = [];
+  // Local-mode layout is compact: the Download button sits on the
+  // range row to the right of the select. Miyo-mode keeps its
+  // existing actions row (Send to Miyo / Check again, plus Stop).
+  let rangeBlock = '';
+  let actionsRow = '';
+
   if (!s.session?.signedIn) {
-    actions.push(
-      `<button class="primary-button" data-action="open-site" data-site="${escape(s.id)}">Sign in to ${escape(s.label)} →</button>`
-    );
+    actionsRow = `
+      <div class="site-actions">
+        <button class="primary-button" data-action="open-site" data-site="${escape(s.id)}">Sign in to ${escape(s.label)} →</button>
+      </div>`;
   } else if (miyoMode) {
     const hasNew = (s.new_available ?? 0) > 0;
     const label = isCapturing
@@ -288,46 +283,29 @@ function renderSiteRow(s: SiteRow): string {
       : hasNew
         ? `Send to Miyo (${s.new_available}${s.new_available_saturated ? '+' : ''})`
         : `${REFRESH_ICON}<span>Check again</span>`;
-    actions.push(
-      `<button class="primary-button refresh-button" data-action="capture-miyo" data-site="${escape(s.id)}" ${anyBusy && !isCapturing ? 'disabled' : ''}>${label}</button>`
-    );
-    if (isCapturing) {
-      actions.push(
-        `<button class="link-button link-button-danger" data-action="cancel" data-site="${escape(s.id)}">Stop</button>`
-      );
-    }
+    const stopBtn = isCapturing
+      ? `<button class="link-button link-button-danger" data-action="cancel" data-site="${escape(s.id)}">Stop</button>`
+      : '';
+    actionsRow = `
+      <div class="site-actions">
+        <button class="primary-button refresh-button" data-action="capture-miyo" data-site="${escape(s.id)}" ${anyBusy && !isCapturing ? 'disabled' : ''}>${label}</button>
+        ${stopBtn}
+      </div>`;
   } else {
-    const captureLabel = isCapturing
-      ? 'Capturing…'
-      : `${DOWNLOAD_ICON}<span>Capture Recent Conversations</span>`;
-    actions.push(
-      `<button class="primary-button refresh-button" data-action="capture-zip" data-site="${escape(s.id)}" ${anyBusy && !isCapturing ? 'disabled' : ''}>${captureLabel}</button>`
-    );
-    if (isCapturing) {
-      actions.push(
-        `<button class="link-button link-button-danger" data-action="cancel" data-site="${escape(s.id)}">Stop</button>`
-      );
-    } else if ((s.cached_count ?? 0) > 0) {
-      actions.push(
-        `<button class="link-button" data-action="export-zip" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>Export ZIP</button>`
-      );
-    }
+    const range = getRange(s.id);
+    const downloadBtn = isCapturing
+      ? `<button class="link-button link-button-danger" data-action="cancel" data-site="${escape(s.id)}">Stop</button>`
+      : `<button class="primary-button refresh-button site-range-action" data-action="capture-local" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>${DOWNLOAD_ICON}<span>Download</span></button>`;
+    rangeBlock = renderRangePicker(s.id, range, downloadBtn, isCapturing);
   }
 
   const progress = isCapturing ? renderProgress() : '';
 
-  // Range picker: zip mode only, only when signed in and not
-  // currently capturing. Miyo mode does its own incremental diff so
-  // no range selector is needed there.
-  const showPicker = !miyoMode && s.session?.signedIn && !isCapturing;
-  const range = getRange(s.id);
-  const rangePicker = showPicker ? renderRangePicker(s.id, range) : '';
-
-  // Hint about the safety cap. Now that the user controls the range,
-  // the cap is explained as a per-run safety, not a fixed limit.
-  const zipHint =
+  // Local-mode footnote: where files land. Drop the per-run cap
+  // mention — there's no cap now.
+  const localHint =
     !miyoMode && s.session?.signedIn
-      ? `<div class="site-hint">Newest first within your range, up to 200 conversations per run.</div>`
+      ? `<div class="site-hint">Newest first within your range. Files land in Downloads/miyo-capture/${escape(s.id)}/.</div>`
       : '';
 
   return `
@@ -339,15 +317,20 @@ function renderSiteRow(s: SiteRow): string {
         </div>
         <span class="status-pill site-status ${status.cls}">${escape(status.text)}</span>
       </div>
-      <div class="site-meta">${bodyLine}</div>
-      ${rangePicker}
+      ${bodyLine ? `<div class="site-meta">${bodyLine}</div>` : ''}
+      ${rangeBlock}
       ${progress}
-      <div class="site-actions">${actions.join('')}</div>
-      ${zipHint}
+      ${actionsRow}
+      ${localHint}
     </div>`;
 }
 
-function renderRangePicker(siteId: SiteId, range: TimeRange): string {
+function renderRangePicker(
+  siteId: SiteId,
+  range: TimeRange,
+  actionButtonHtml: string,
+  disabled: boolean
+): string {
   const presetValue = range.kind === 'preset' ? range.preset : 'custom';
   const presetOptions: Array<{ value: string; label: string }> = [
     { value: '24h', label: PRESET_LABELS['24h'] },
@@ -367,23 +350,25 @@ function renderRangePicker(siteId: SiteId, range: TimeRange): string {
     range.kind === 'custom' ? range.sinceISODate : defaultSinceDate();
   const untilValue =
     range.kind === 'custom' ? range.untilISODate : todayISODate();
+  const dis = disabled ? 'disabled' : '';
   // Both date inputs only appear when "Custom…" is selected. They sit
   // on a second row so the 400px popup width can fit them comfortably.
   const customRow =
     range.kind === 'custom'
       ? `
         <div class="site-range-custom">
-          <input type="date" class="site-range-date" data-site="${escape(siteId)}" data-edge="since" value="${escape(sinceValue)}" />
+          <input type="date" class="site-range-date" data-site="${escape(siteId)}" data-edge="since" value="${escape(sinceValue)}" ${dis} />
           <span class="site-range-arrow">→</span>
-          <input type="date" class="site-range-date" data-site="${escape(siteId)}" data-edge="until" value="${escape(untilValue)}" />
+          <input type="date" class="site-range-date" data-site="${escape(siteId)}" data-edge="until" value="${escape(untilValue)}" ${dis} />
         </div>`
       : '';
   return `
     <div class="site-range-row">
       <label class="site-range-label">Range</label>
-      <select class="site-range-select" data-site="${escape(siteId)}">
+      <select class="site-range-select" data-site="${escape(siteId)}" ${dis}>
         ${optionsHtml}
       </select>
+      ${actionButtonHtml}
     </div>
     ${customRow}`;
 }
@@ -455,9 +440,8 @@ function render(): void {
     btn.addEventListener('click', () => {
       const action = btn.dataset.action;
       const site = btn.dataset.site as SiteId | undefined;
-      if (action === 'capture-zip' && site) void onCapture(site, 'zip');
+      if (action === 'capture-local' && site) void onCapture(site, 'local');
       else if (action === 'capture-miyo' && site) void onCapture(site, 'miyo');
-      else if (action === 'export-zip' && site) void onExportZip(site);
       else if (action === 'cancel' && site) onCancel(site);
       else if (action === 'open-site' && site) onOpenSite(site);
     });
@@ -529,7 +513,7 @@ function onRangeCustomDateChange(
 // Actions
 // ──────────────────────────────────────────────────────────────────
 
-function onCapture(siteId: SiteId, mode: 'zip' | 'miyo'): void {
+function onCapture(siteId: SiteId, mode: 'local' | 'miyo'): void {
   ui.banner = null;
   ui.capturing = siteId;
   ui.captureProgress = { phase: 'listing', completed: 0, total: null };
@@ -539,10 +523,10 @@ function onCapture(siteId: SiteId, mode: 'zip' | 'miyo'): void {
   const startMsg: {
     type: 'start';
     site: SiteId;
-    mode: 'zip' | 'miyo';
+    mode: 'local' | 'miyo';
     range?: TimeRange;
   } = { type: 'start', site: siteId, mode };
-  if (mode === 'zip') startMsg.range = getRange(siteId);
+  if (mode === 'local') startMsg.range = getRange(siteId);
   port.postMessage(startMsg);
   wirePort(port, siteId);
 }
@@ -554,44 +538,6 @@ function onCancel(siteId: SiteId): void {
 function onOpenSite(siteId: SiteId): void {
   const site = findSite(siteId);
   if (site) void chrome.tabs.create({ url: site.home_url });
-}
-
-async function onExportZip(siteId: SiteId): Promise<void> {
-  const site = findSite(siteId);
-  if (!site) return;
-  ui.banner = null;
-  try {
-    const cache = await getCache(siteId);
-    const files = Object.values(cache).map((c) => ({
-      filename: c.filename,
-      content: c.markdown,
-    }));
-    if (files.length === 0) {
-      ui.banner = { kind: 'error', text: 'No captures to export. Click Capture first.' };
-      render();
-      return;
-    }
-    const blob = buildZip(files);
-    const stamp = new Date().toISOString().slice(0, 10);
-    const zipName = `miyo-capture-${site.label.toLowerCase().replace(/\s+/g, '-')}-${stamp}.zip`;
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = zipName;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    // Defer revocation so the download has time to start.
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
-    ui.banner = {
-      kind: 'info',
-      text: `Exported ${files.length} conversation${files.length === 1 ? '' : 's'} to ${zipName}`,
-    };
-    render();
-  } catch (err) {
-    ui.banner = { kind: 'error', text: err instanceof Error ? err.message : String(err) };
-    render();
-  }
 }
 
 function wirePort(port: chrome.runtime.Port, siteId: SiteId): void {
@@ -632,17 +578,11 @@ function wirePort(port: chrome.runtime.Port, siteId: SiteId): void {
                   : `Sent ${written} to Miyo.`,
           };
         } else if (written > 0) {
-          // Auto-download the zip. onExportZip sets its own
-          // "Exported N to <file>" banner once the blob is built,
-          // overwriting this transient one within tens of ms.
-          const saturated = done.result.saturated === true;
           const rangeDesc = describeRange(getRange(done.site));
-          let text = `Captured ${written} from ${rangeDesc}`;
+          let text = `Saved ${written} from ${rangeDesc} to Downloads/miyo-capture/${done.site}/`;
           if (errors > 0) text += ` (${errors} failed)`;
-          if (saturated) text += ' — more in range; narrow your range to get older ones';
-          text += '. Preparing download…';
+          text += '.';
           ui.banner = { kind: 'info', text };
-          void onExportZip(done.site);
         } else {
           const rangeDesc = describeRange(getRange(done.site));
           ui.banner = {

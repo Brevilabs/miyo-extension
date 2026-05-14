@@ -1,11 +1,13 @@
 // Cross-cutting types shared by the framework, adapters, and UI.
 //
 // The extension is intentionally stateless across runs. There is no
-// persistent SiteState or SyncProgress — each capture run is a fresh
-// one-shot. The only data that persists is:
-//   • In Miyo mode: nothing locally. Miyo holds the index.
-//   • In zip mode: the per-site cache (id → rendered markdown), used
-//     to avoid refetching unchanged conversations on the next click.
+// persistent SiteState, SyncProgress, or per-item cache — each
+// capture run is a fresh one-shot. The only data that persists is:
+//   • Miyo mode: nothing locally. Miyo holds the index.
+//   • Local mode: nothing locally. Files in the user's Downloads
+//     folder are the source of truth; reruns overwrite cleanly.
+// Small UI prefs (time_ranges, last_snapshot) still live in
+// chrome.storage.local but never hold per-item state.
 
 import type { ChatConversation } from './chat.js';
 
@@ -157,10 +159,6 @@ export interface SiteRow {
 
   // Session probe, attempted on popup open. Null = not yet probed.
   session: SiteSession | null;
-
-  // Zip-mode bookkeeping. Number of conversations currently in the
-  // local cache for this site. Null until the cache has been read.
-  cached_count: number | null;
 
   // Miyo-mode bookkeeping. Populated when Miyo is connected.
   // total: how many conversations Miyo has stored for this site.

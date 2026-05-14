@@ -1,33 +1,37 @@
 // Capture orchestrator.
 //
-// Two flows share the inner loop (paged list → fetch+render with cache
-// reuse) but differ at the edges:
+// Two flows share the inner loop (paged list → fetch+render → write)
+// but differ at the edges:
 //
-//   captureForExport (zip mode)
-//     • Stops at MAX_ZIP_ITEMS newest, or list exhausted
-//     • Reuses local cache to skip refetching unchanged items
-//     • Rewrites the cache to exactly the captured set at the end
-//     • Cap is the safety: 200 items finishes well inside 5 min
+//   captureToLocalFiles (local mode — Miyo not installed)
+//     • User picks a time-range window; we capture newest-first
+//       within it, up to a MAX_ZIP_ITEMS safety cap.
+//     • Each rendered item is written directly to the user's
+//       Downloads folder via chrome.downloads.download (one .md per
+//       item, conflictAction:'overwrite'). The filesystem is the
+//       source of truth; the extension stores no per-item state.
 //
 //   captureToMiyo (Miyo mode)
 //     • No cap. Miyo holds the full library; the extension only sends
-//       the delta
+//       the delta.
 //     • Diff: list newest-first, comparing each item against the
-//       app-folder metadata blob; stop at the first clean page
+//       app-folder metadata blob; stop at the first clean page.
 //     • POSTs each rendered item as a .md file via /v0/file, and
-//       updates the metadata blob (every FLUSH_EVERY items + at end)
+//       updates the metadata blob (every FLUSH_EVERY items + at end).
 //
 // Neither flow persists run progress. If the SW dies, the next click
 // starts fresh:
-//   • Zip mode: cache makes the retry cheap.
+//   • Local mode: re-running captures into the same paths; overwrite
+//     makes the retry safely idempotent. Any items downloaded before
+//     the death survive on disk.
 //   • Miyo mode: the metadata blob (last flushed) is the index. Items
 //     written but not yet recorded in metadata get re-captured next
 //     run (POST /v0/file with force:true is idempotent), so worst-case
 //     redo is FLUSH_EVERY-1 items.
 
 import { FatalError, paced } from './rate-limit.js';
-import { getCache, setCache, type SiteCache } from './cache.js';
 import { renderChatConversationMarkdown } from './chat.js';
+import { downloadMarkdown } from './downloader.js';
 import { makeDatePrefixedFilename } from './filename.js';
 import { MiyoClient, MiyoUnavailableError } from './miyo.js';
 import type {
@@ -38,15 +42,6 @@ import type {
   RenderedItem,
   SiteAdapter,
 } from './types.js';
-
-// Zip-mode runtime safety cap. The user chooses the *range* (e.g.,
-// "last 30 days"); this cap exists only so a user who picks "all
-// available" on a 10,000-conversation account doesn't kick off a
-// multi-hour run inside a browser SW. 200 × ~1.5s rate-limited fetch
-// ≈ 5 min per run. When the cap is hit before the user's range is
-// exhausted, we report saturated:true so the popup can suggest
-// narrowing the range.
-const MAX_ZIP_ITEMS = 200;
 
 // Miyo-mode metadata-flush cadence. Trade-off: a higher number means
 // fewer PUTs but more redo on SW death. 25 items × ~1.5s rate-limited
@@ -67,17 +62,7 @@ export interface CaptureCallbacks {
 }
 
 export type CaptureResult =
-  | {
-      kind: 'completed';
-      mode: 'zip' | 'miyo';
-      written: number;
-      errors: number;
-      // Zip mode only. True when the safety cap stopped paging before
-      // the user's range was exhausted — i.e., more in-range items
-      // exist that we didn't capture. The popup uses this to nudge
-      // the user toward a narrower range.
-      saturated?: boolean;
-    }
+  | { kind: 'completed'; mode: 'local' | 'miyo'; written: number; errors: number }
   | { kind: 'aborted'; reason: string };
 
 // ───────────────────────────────────────────────────────────────────
@@ -143,10 +128,10 @@ function metadataEntry(item: CapturedItem): AppFolderMetadataItem {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// Zip-mode capture (unchanged from prior round)
+// Local-mode capture (Miyo not installed)
 // ───────────────────────────────────────────────────────────────────
 
-export async function captureForExport(
+export async function captureToLocalFiles(
   adapter: SiteAdapter,
   sinceMs: number | null,
   untilMs: number | null,
@@ -155,24 +140,17 @@ export async function captureForExport(
   const session = await adapter.probeSession();
   if (!session.signedIn) return { kind: 'aborted', reason: 'signed_out' };
 
-  const oldCache = await getCache(adapter.id);
-
-  // Phase 1: list items newest-first within the [sinceMs, untilMs)
-  // window. Items above untilMs are *skipped* (still in the "too new"
-  // tail of newest-first ordering); items below sinceMs end the scan.
-  //
-  // Stopping conditions:
-  //   • An item's updated_at falls below sinceMs → window exhausted
-  //     (rangeExhausted = true).
-  //   • toCapture.length hits MAX_ZIP_ITEMS → safety cap; if we
-  //     stopped here without exhausting the window, we saturated and
-  //     the popup should suggest a narrower range.
-  const toCapture: ListItem[] = [];
+  // Page-and-download in lockstep: each list page immediately drives
+  // downloads, so the user sees files flowing into Downloads almost
+  // as soon as the run starts (no separate "scanning" phase to sit
+  // through). The whole thing is naturally bounded by the user's
+  // range — items below sinceMs end the scan, items above untilMs are
+  // skipped (newest-first ordering).
   let listCursor: string | null = null;
-  let listTotal: number | null = null;
-  let rangeExhausted = false;
+  let written = 0;
+  let errors = 0;
 
-  while (toCapture.length < MAX_ZIP_ITEMS && !rangeExhausted) {
+  while (true) {
     if (callbacks.isCancelled?.()) return { kind: 'aborted', reason: 'cancelled' };
     let page;
     try {
@@ -181,63 +159,35 @@ export async function captureForExport(
       if (isSignedOutError(err)) return { kind: 'aborted', reason: 'signed_out' };
       return { kind: 'aborted', reason: errMessage(err) };
     }
-    if (listTotal === null && page.total !== null) listTotal = page.total;
 
+    let rangeExhausted = false;
     for (const item of page.items) {
+      if (callbacks.isCancelled?.()) return { kind: 'aborted', reason: 'cancelled' };
       const ts = Date.parse(item.updated_at);
       if (untilMs !== null && ts >= untilMs) continue; // too new — skip
       if (sinceMs !== null && ts < sinceMs) {
         rangeExhausted = true;
         break;
       }
-      toCapture.push(item);
-      if (toCapture.length >= MAX_ZIP_ITEMS) break;
+      try {
+        const captured = await paced(adapter.id, () => renderForAdapter(adapter, item));
+        await downloadMarkdown(adapter.id, captured);
+        written += 1;
+      } catch (err) {
+        if (isSignedOutError(err)) return { kind: 'aborted', reason: 'signed_out' };
+        errors += 1;
+      }
+      // Total is unknown without an upfront listing pass — popup
+      // shows an indeterminate bar plus the running count.
+      callbacks.onProgress({ phase: 'fetching', completed: written, total: null });
     }
-    callbacks.onProgress({
-      phase: 'listing',
-      completed: toCapture.length,
-      total: Math.min(MAX_ZIP_ITEMS, listTotal ?? MAX_ZIP_ITEMS),
-    });
+
     if (rangeExhausted) break;
     if (page.next_cursor === null) break;
     listCursor = page.next_cursor;
   }
 
-  // saturated = we hit the safety cap (200) but the user's range
-  // wasn't exhausted, so there are more in-range items we skipped.
-  const saturated = toCapture.length >= MAX_ZIP_ITEMS && !rangeExhausted;
-
-  // Phase 2: fetch only what cache doesn't already cover.
-  const newCache: SiteCache = {};
-  let written = 0;
-  let errors = 0;
-  const total = toCapture.length;
-
-  for (const item of toCapture) {
-    if (callbacks.isCancelled?.()) return { kind: 'aborted', reason: 'cancelled' };
-    const cached = oldCache[item.id];
-    if (cached && cached.updated_at === item.updated_at) {
-      newCache[item.id] = cached;
-      written += 1;
-    } else {
-      try {
-        const captured = await paced(adapter.id, () => renderForAdapter(adapter, item));
-        newCache[captured.item_id] = captured;
-        written += 1;
-      } catch (err) {
-        if (isSignedOutError(err)) {
-          await setCache(adapter.id, { ...oldCache, ...newCache });
-          return { kind: 'aborted', reason: 'signed_out' };
-        }
-        errors += 1;
-      }
-    }
-    callbacks.onProgress({ phase: 'fetching', completed: written, total });
-  }
-
-  // Rewrite the cache to exactly the captured set.
-  await setCache(adapter.id, newCache);
-  return { kind: 'completed', mode: 'zip', written, errors, saturated };
+  return { kind: 'completed', mode: 'local', written, errors };
 }
 
 // ───────────────────────────────────────────────────────────────────

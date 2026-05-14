@@ -22,12 +22,11 @@
 
 import { ADAPTERS, getAdapter } from '../adapters/index.js';
 import {
-  captureForExport,
+  captureToLocalFiles,
   captureToMiyo,
   indexFromMetadata,
   probeMiyoDelta,
 } from '../framework/capture.js';
-import { cachedCount } from '../framework/cache.js';
 import { MiyoClient, MiyoUnavailableError } from '../framework/miyo.js';
 import type {
   PopupSnapshot,
@@ -159,7 +158,6 @@ async function buildRow(
     }
   }
 
-  const cached = miyoIndexFor === null ? await cachedCount(adapter.id) : null;
   const session = await sessionPromise;
 
   return {
@@ -168,7 +166,6 @@ async function buildRow(
     home_url: adapter.home_url,
     brand_color: adapter.brand_color ?? null,
     session,
-    cached_count: cached,
     miyo_total: miyoTotal,
     new_available: newAvailable,
     new_available_saturated: newSaturated,
@@ -258,7 +255,7 @@ clearBadge();
 
 interface RunningRun {
   siteId: SiteId;
-  mode: 'zip' | 'miyo';
+  mode: 'local' | 'miyo';
   subscribers: Set<chrome.runtime.Port>;
   progress: { phase: 'listing' | 'fetching'; completed: number; total: number | null };
   cancelRequested: boolean;
@@ -322,7 +319,7 @@ chrome.runtime.onConnect.addListener((port) => {
     const m = msg as {
       type?: string;
       site?: string;
-      mode?: 'zip' | 'miyo';
+      mode?: 'local' | 'miyo';
       range?: TimeRange;
     };
 
@@ -350,7 +347,7 @@ chrome.runtime.onConnect.addListener((port) => {
     }
 
     if (m.type !== 'start' || typeof m.site !== 'string') return;
-    if (m.mode !== 'zip' && m.mode !== 'miyo') return;
+    if (m.mode !== 'local' && m.mode !== 'miyo') return;
 
     const adapter = getAdapter(m.site);
     if (!adapter) {
@@ -430,7 +427,7 @@ chrome.runtime.onConnect.addListener((port) => {
         } else {
           const range: TimeRange = m.range ?? DEFAULT_TIME_RANGE;
           const { sinceMs, untilMs } = rangeToWindow(range);
-          result = await captureForExport(adapter, sinceMs, untilMs, callbacks);
+          result = await captureToLocalFiles(adapter, sinceMs, untilMs, callbacks);
         }
         broadcast(entry, { type: 'done', site: adapter.id, result });
       } catch (err) {

@@ -446,6 +446,14 @@ main {
   flex-wrap: wrap;
 }
 
+.site-range-row .site-range-action {
+  margin-left: auto;
+}
+
+.site-range-row .link-button-danger {
+  margin-left: auto;
+}
+
 .site-range-label {
   font-size: 11.5px;
   color: var(--ink-soft);
