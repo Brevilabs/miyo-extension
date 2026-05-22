@@ -1,30 +1,50 @@
 # Miyo Capture
 
-> Capture your AI chats as local markdown, in a folder you choose.
+> Capture your AI chats as markdown. Yours, on your machine.
 
-A browser extension that saves your **ChatGPT** and **Claude**
-conversations as markdown files on your own machine. One conversation
-per file. No accounts, no servers, no cloud.
+A browser extension that turns your **ChatGPT** and **Claude**
+conversations into markdown files. No accounts, no servers in the
+cloud, no telemetry.
 
-The captured folder is plain markdown — use it with **Miyo Desktop**,
-**Obsidian**, **Logseq**, your code editor, or just `grep`. Miyo
-Capture writes; you decide what reads.
+It runs in two modes, depending on what you have installed:
+
+- **With [Miyo desktop](https://www.miyo.md/)** — captures stream
+  directly into your Miyo library as you click Capture. Miyo handles
+  storage, dedup, and search.
+- **Without Miyo** — captures buffer in the extension, then download
+  as a single ZIP of markdown files to your Downloads folder. One
+  conversation per file.
+
+The output is plain markdown — open it in **Obsidian**, **Logseq**,
+your editor, or `grep`. Nothing locks you in.
+
+## Install
+
+- **Browser extension store** — *coming soon.*
+- **From a release artifact** — grab the latest
+  `miyo-capture-<version>-chrome.zip` from
+  [Releases](https://github.com/Brevilabs/miyo-sync/releases),
+  unzip it, then in `chrome://extensions` enable Developer mode
+  and click **Load unpacked** on the unzipped folder.
 
 ## How it works
 
-1. Install the extension.
-2. Open the popup. Pick which sites to capture from (ChatGPT, Claude).
-3. For each site, pick a folder on your computer.
-4. Captures land in that folder as you sync. One markdown file per
-   conversation.
+1. Open the popup. You'll see one card per supported site
+   (ChatGPT, Claude).
+2. Sign in to the site in a tab (if you aren't already).
+3. Pick a time range (last 7 days, 30 days, all available, or a
+   custom window).
+4. Click **Capture to Miyo** (if Miyo desktop is running) or
+   **Download** (to get a ZIP).
 
-Each destination folder gets a hidden `.miyo-capture.json` describing
-the source — so tools like Miyo Desktop can recognize the folder as,
-say, "your ChatGPT archive" and render it accordingly.
+The header shows a Miyo toggle when the desktop app is reachable on
+`http://127.0.0.1:8742`. Turn it off to force ZIP mode even with
+Miyo running.
 
 ## What's captured
 
-- **ChatGPT** — full conversation history (titles, timestamps, messages).
+- **ChatGPT** — full conversation history (titles, timestamps,
+  messages).
 - **Claude (claude.ai)** — full conversation history.
 
 More sources are planned. Each is a single adapter file — see
@@ -32,38 +52,47 @@ More sources are planned. Each is a single adapter file — see
 
 ## Design
 
-- **Sync only when you click.** No background polling, no alarms.
-- **Local only.** Conversation data never leaves your machine.
-- **Folder is the source of truth.** Dedup, cursor, and sync state
-  live in `.miyo-capture.json` inside the destination folder — not in
-  extension storage. If you reinstall the extension or move to a new
-  machine, point it at the same folder and it picks up where it left off.
-- **Pause and resume per site.** Toggle a site off without losing its
-  destination or capture history.
-- **No lock-in.** The output is plain markdown. The metadata file is
-  small JSON. Any tool can consume it; nothing about Miyo Capture
-  forces you to keep using Miyo Capture.
+- **Sync only when you click.** No background polling, no alarms,
+  no service-worker timers. Every fetch is a direct consequence of
+  you pressing Capture.
+- **Local only.** Conversation data goes to your Downloads folder
+  (ZIP mode) or your Miyo desktop app (Miyo mode). It never leaves
+  your machine.
+- **Zero runtime dependencies, zero telemetry.** The extension
+  ships no analytics and no feedback pings.
+- **Pause and resume.** A capture can be paused mid-run and
+  resumed later from the same cursor — useful for large histories.
+- **No lock-in.** The output is plain markdown. Any tool that
+  reads files can consume it.
 
 ## Browser support
 
-- **Chrome / Edge / Brave / Arc / Chromium**: full support. Pick any
-  folder via the File System Access API.
-- **Firefox / Safari**: planned. These browsers don't expose a "pick
-  any folder" API, so captures will land in your Downloads folder.
+Chromium-based browsers only for now: **Chrome, Edge, Brave, Arc**,
+and other Chromium variants. Firefox and Safari are planned.
 
 ## Output format
 
-Each conversation: `<your folder>/<YYYY-MM-DD> <title> (<shortId>).md`
+Each conversation becomes one markdown file:
 
-Contains:
-- YAML frontmatter — `platform`, `conversation_id`, `title`, `url`,
-  `created_at`, `updated_at`.
-- One section per message, headed `## User · 2026-04-28 14:32` or
-  `## Assistant · …`.
+```
+<YYYY-MM-DD> <title> (<shortId>).md
+```
 
-Plus one hidden metadata file: `<your folder>/.miyo-capture.json` —
-identifies the source (chatgpt / claude / …) and tracks which
-conversations have been captured.
+In ZIP mode the archive is named
+`miyo-capture-<site>-<YYYY-MM-DD>.zip`. In Miyo mode the file lands
+in the Miyo-managed folder for that site.
+
+Each file contains:
+
+- **YAML frontmatter** — `platform`, `conversation_id`, `title`,
+  `url`, `created_at`, `updated_at`.
+- **`# Title`** — the conversation title as an H1.
+- **One `## Turn · <timestamp>` section per conversational turn** —
+  a user prompt and the assistant replies that follow it stay
+  grouped in one section. Inside each turn, individual messages
+  are introduced by a bold `**User · <timestamp>**` or
+  `**Assistant · <timestamp>**` line — not a heading — so the turn
+  remains one section for downstream chunkers.
 
 ## Development
 
@@ -72,6 +101,8 @@ npm install
 npm run build              # builds to ./dist
 npm run build:watch        # rebuild on change
 npm run typecheck
+npm run lint
+npm run test:unit
 ```
 
 Then load `./dist` as an unpacked extension in `chrome://extensions`
@@ -85,7 +116,8 @@ npm run package            # produces miyo-capture-<version>-chrome.zip
 
 Adding a new site? Read
 [docs/ADAPTER-API.md](docs/ADAPTER-API.md) and
-[docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
+[docs/CONTRIBUTING.md](docs/CONTRIBUTING.md). The Miyo desktop
+protocol is documented in [docs/MIYO_INTERFACE.md](docs/MIYO_INTERFACE.md).
 
 ## License
 
