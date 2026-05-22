@@ -9,12 +9,14 @@
     "build": "node scripts/build.mjs",
     "build:watch": "node scripts/build.mjs --watch",
     "typecheck": "tsc --noEmit",
+    "test:unit": "node -e \"require('fs').rmSync('.test-dist',{recursive:true,force:true})\" && tsc -p tsconfig.test.json && node --test \".test-dist/**/*.test.js\"",
     "lint": "eslint src --ext .ts",
     "package": "npm run build && node scripts/package.mjs",
     "version": "node scripts/sync-version.mjs"
   },
   "devDependencies": {
     "@types/chrome": "^0.0.270",
+    "@types/node": "^25.9.1",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
     "esbuild": "^0.24.0",

@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".test-dist",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"]
+  },
+  "include": [
+    "src/framework/chat.ts",
+    "src/framework/markdown.ts",
+    "src/framework/**/*.test.ts"
+  ],
+  "exclude": []
+}

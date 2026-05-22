@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.test-dist/
 *.zip
 .DS_Store
 *.log
