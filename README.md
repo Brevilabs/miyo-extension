@@ -20,7 +20,7 @@ your editor, or `grep`. Nothing locks you in.
 - **Browser extension store** — *coming soon.*
 - **From a release artifact** — grab the latest
   `miyo-capture-<version>-chrome.zip` from
-  [Releases](https://github.com/Brevilabs/miyo-sync/releases),
+  [Releases](https://github.com/Brevilabs/miyo-extension/releases),
   unzip it, then in `chrome://extensions` enable Developer mode
   and click **Load unpacked** on the unzipped folder.
 
@@ -56,6 +56,16 @@ More sources are planned. Each is a single adapter file — see
   useful for large histories.
 - **No lock-in.** The output is plain markdown. Any tool that
   reads files can consume it.
+
+## From the makers of Miyo
+
+Miyo Capture is made by [Miyo](https://www.miyo.md/), your personal
+context hub. The conversations you export here can become part of a
+local, searchable memory that any AI can use — so ChatGPT can pick up
+what you told Claude yesterday, and vice versa. Miyo Desktop keeps
+everything as plain files on your own computer (no cloud uploads) and
+connects to ChatGPT and Claude over MCP. It's a separate, optional,
+free app — [make it your own](https://www.miyo.md/).
 
 ## Browser support
 
