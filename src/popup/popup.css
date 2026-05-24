@@ -713,8 +713,27 @@ main {
   color: var(--muted);
 }
 
+.pop-foot-left {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
 .pop-foot-tag {
   font-style: italic;
+}
+
+.pop-foot-link {
+  color: var(--teal-strong);
+  text-decoration: none;
+  font-style: normal;
+  transition: color 0.15s ease;
+}
+
+.pop-foot-link:hover {
+  color: var(--teal-deep);
+  text-decoration: underline;
 }
 
 ::-webkit-scrollbar {
