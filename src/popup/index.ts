@@ -337,7 +337,6 @@ function renderFooter(): string {
         <span class="pop-foot-tag">yours, on your machine</span>
         <a class="pop-foot-link" href="https://www.miyo.md/" target="_blank" rel="noopener noreferrer">Part of Miyo — your context hub →</a>
       </div>
-      <span class="pop-ver">v${escape(chrome.runtime.getManifest().version)}</span>
     </div>
   `;
 }

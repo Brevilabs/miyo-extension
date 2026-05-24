@@ -103,12 +103,6 @@ main {
   text-transform: none;
 }
 
-.pop-ver {
-  font-family: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, monospace;
-  font-size: 10px;
-  color: var(--muted);
-}
-
 .pop-stat {
   display: flex;
   flex-direction: column;
