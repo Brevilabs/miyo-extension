@@ -17,7 +17,7 @@ MV3 Chrome extension, zero runtime dependencies. Two esbuild entry points: `src/
 
 **Adapter ↔ framework split.** Adapters (`src/adapters/`) know one site's backend; the framework (`src/framework/`) owns rate limiting, file delivery, resume, and progress. New sites are one file in `src/adapters/` + entry in `src/adapters/index.ts` + host in `public/manifest.json`. Two kinds in `framework/types.ts`: `kind: 'chat'` returns a `ChatConversation` and the framework renders it uniformly; `kind: 'custom'` returns `{ filename, body }` and owns its own rendering. See `docs/ADAPTER-API.md` for the full contract.
 
-**Capture loop.** `framework/capture.ts::captureToStore` is mode-agnostic: walks `listItems` newest-first, calls `Store.filterMissing` to skip already-captured ids, fetches the missing. Two `Store` backends in `framework/capture-store.ts`: `IdbStore` buffers to IndexedDB (popup zips at end), `MiyoStore` POSTs to the Miyo desktop at `http://127.0.0.1:8742` (contract in `docs/MIYO_INTERFACE.md`). Mode is chosen per run by probing Miyo's `/v0/health` on popup open — reachable → Miyo, otherwise local zip.
+**Capture loop.** `framework/capture.ts::captureToStore` walks `listItems` newest-first, calls `Store.filterMissing` to skip already-captured ids, and fetches the missing. One `Store` backend in `framework/capture-store.ts`: `IdbStore` buffers captured items to IndexedDB; the popup builds a ZIP from the buffer and downloads it when the run completes, then clears the buffer. `pending_run` (in `chrome.storage.local`) survives a service-worker death so the popup can offer Resume from the same cursor.
 
 ## Hard constraints (not enforced by code)
 

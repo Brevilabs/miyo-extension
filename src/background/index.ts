@@ -3,22 +3,19 @@
 // Responsibilities:
 //
 //   1. Snapshot building. The popup asks for a snapshot; we probe
-//      each site's session in parallel and check whether Miyo is
-//      reachable. No per-site Miyo round trips — the popup only
-//      needs connectivity + session, not counts.
+//      each site's session in parallel. The popup only needs
+//      connectivity + session, not counts.
 //
-//   2. Capture dispatch. The popup tells us to capture a site in
-//      either 'local' or 'miyo' mode; we own the run so it survives
-//      popup-close. Progress streams back over the port. Cancel and
-//      Pause are flags read by the capture loop's shouldStop hook.
+//   2. Capture dispatch. The popup tells us to capture a site; we own
+//      the run so it survives popup-close. Progress streams back over
+//      the port. Cancel is a flag read by the capture loop's
+//      shouldStop hook.
 //
 //   3. Badge animation while a run is in flight.
 
 import { ADAPTERS, getAdapter } from '../adapters/index.js';
 import { captureToStore } from '../framework/capture.js';
-import { IdbStore, MiyoStore } from '../framework/capture-store.js';
-import type { Store } from '../framework/capture-store.js';
-import { MiyoClient, MiyoUnavailableError } from '../framework/miyo.js';
+import { IdbStore } from '../framework/capture-store.js';
 import { clearItems } from '../framework/store.js';
 import {
   clearPendingRun,
@@ -27,7 +24,6 @@ import {
   writePendingRun,
 } from '../framework/run-state.js';
 import type {
-  CaptureMode,
   PopupSnapshot,
   SiteAdapter,
   SiteId,
@@ -83,42 +79,6 @@ function rangeToWindow(range: TimeRange): {
 }
 
 // ──────────────────────────────────────────────────────────────────
-// Miyo client lifecycle
-// ──────────────────────────────────────────────────────────────────
-//
-// One MiyoClient cache pointer in the SW. Re-probed fresh on every
-// popup snapshot (`forceProbe: true`) so the connected/disconnected
-// state always reflects Miyo's current liveness — not a stale "we
-// connected earlier this session" reading. Within a single capture
-// run, the run holds its own client reference, so wiping the cache
-// here doesn't disturb it.
-//
-// For non-snapshot callers (the capture dispatch path), we still
-// reuse the cache if it's alive — a single popup interaction does
-// snapshot → start capture, so the capture inherits the fresh probe.
-
-let miyo: MiyoClient | null = null;
-
-async function getMiyo(forceProbe = false): Promise<MiyoClient | null> {
-  if (!forceProbe && miyo && miyo.isAlive()) return miyo;
-  // Drop the cache pointer (do NOT call disconnect() — that would
-  // mark an in-flight capture's client dead).
-  miyo = null;
-  try {
-    miyo = await MiyoClient.connect();
-    return miyo;
-  } catch (err) {
-    // Expected for every user without the Miyo desktop app — keep
-    // quiet here, the local-mode (Download) UI is the answer.
-    if (!(err instanceof MiyoUnavailableError)) {
-      console.warn('miyo connect failed', err);
-    }
-    miyo = null;
-    return null;
-  }
-}
-
-// ──────────────────────────────────────────────────────────────────
 // Snapshot
 // ──────────────────────────────────────────────────────────────────
 
@@ -142,14 +102,12 @@ async function buildRow(adapter: SiteAdapter): Promise<SiteRow> {
 }
 
 async function buildSnapshot(): Promise<PopupSnapshot> {
-  const client = await getMiyo(true);
   const [sites, pendingRun] = await Promise.all([
     Promise.all(ADAPTERS.map((a) => buildRow(a))),
     readPendingRun(),
   ]);
 
   const snapshot: PopupSnapshot = {
-    miyo_connected: client !== null,
     sites,
     pending_run: pendingRun,
   };
@@ -200,13 +158,9 @@ clearBadge();
 
 interface RunningRun {
   siteId: SiteId;
-  mode: CaptureMode;
   subscribers: Set<chrome.runtime.Port>;
   progress: { phase: 'listing' | 'fetching'; completed: number; total: number | null };
   cancelRequested: boolean;
-  // Soft halt: capture flushes its state and returns aborted/paused;
-  // pending_run is left intact so Resume picks up at the same cursor.
-  pauseRequested: boolean;
 }
 
 let runningRun: RunningRun | null = null;
@@ -256,7 +210,6 @@ chrome.runtime.onConnect.addListener((port) => {
     const m = msg as {
       type?: string;
       site?: string;
-      mode?: CaptureMode;
       range?: TimeRange;
     };
 
@@ -267,16 +220,9 @@ chrome.runtime.onConnect.addListener((port) => {
       return;
     }
 
-    if (m.type === 'pause' && typeof m.site === 'string') {
-      if (runningRun && runningRun.siteId === m.site) {
-        runningRun.pauseRequested = true;
-      }
-      return;
-    }
-
     if (m.type === 'discard') {
       void (async () => {
-        if (runningRun?.mode === 'local') {
+        if (runningRun) {
           runningRun.cancelRequested = true;
         }
         const run = await readPendingRun();
@@ -310,7 +256,6 @@ chrome.runtime.onConnect.addListener((port) => {
 
     void (async () => {
       let siteId: SiteId;
-      let mode: CaptureMode;
       let range: TimeRange | null;
 
       if (isResume) {
@@ -324,13 +269,10 @@ chrome.runtime.onConnect.addListener((port) => {
           return;
         }
         siteId = run.siteId;
-        mode = run.mode;
         range = run.range;
         await writePendingRun({ ...run, status: 'capturing' });
       } else {
-        if (m.mode !== 'local' && m.mode !== 'miyo') return;
         siteId = m.site as SiteId;
-        mode = m.mode;
         range = m.range ?? null;
       }
 
@@ -379,7 +321,6 @@ chrome.runtime.onConnect.addListener((port) => {
         const usedRange: TimeRange = range ?? DEFAULT_TIME_RANGE;
         await writePendingRun({
           siteId: adapter.id,
-          mode,
           range: usedRange,
           started_at: Date.now(),
           status: 'capturing',
@@ -393,7 +334,6 @@ chrome.runtime.onConnect.addListener((port) => {
       const resumeFrom = isResume ? (await readPendingRun())?.written ?? 0 : 0;
       const entry: RunningRun = {
         siteId: adapter.id,
-        mode,
         subscribers: new Set([port]),
         progress: {
           phase: 'listing',
@@ -401,7 +341,6 @@ chrome.runtime.onConnect.addListener((port) => {
           total: null,
         },
         cancelRequested: false,
-        pauseRequested: false,
       };
       runningRun = entry;
       showBadge(adapter.label);
@@ -429,60 +368,18 @@ chrome.runtime.onConnect.addListener((port) => {
               note,
             });
           },
-          shouldStop: () =>
-            entry.cancelRequested ? 'cancelled' : entry.pauseRequested ? 'paused' : null,
+          shouldStop: () => (entry.cancelRequested ? 'cancelled' : null),
         };
 
         const usedRange: TimeRange = range ?? DEFAULT_TIME_RANGE;
         const { sinceMs, untilMs } = rangeToWindow(usedRange);
 
-        let store: Store;
-        let result;
-        if (mode === 'miyo') {
-          const client = await getMiyo();
-          if (!client) {
-            result = { kind: 'aborted' as const, reason: 'miyo_unavailable' };
-          } else {
-            try {
-              const folder = await client.ensureAppFolder(adapter.id, adapter.label);
-              store = new MiyoStore(client, adapter.id, folder.folder_name);
-            } catch (err) {
-              const reason =
-                err instanceof MiyoUnavailableError
-                  ? 'miyo_unavailable'
-                  : err instanceof Error
-                    ? err.message
-                    : String(err);
-              result = { kind: 'aborted' as const, reason };
-              store = null as unknown as Store;
-            }
-            if (!result) {
-              result = await captureToStore(
-                adapter,
-                store!,
-                'miyo',
-                sinceMs,
-                untilMs,
-                callbacks
-              );
-            }
-          }
-        } else {
-          store = new IdbStore(adapter.id);
-          result = await captureToStore(
-            adapter,
-            store,
-            'local',
-            sinceMs,
-            untilMs,
-            callbacks
-          );
-        }
+        const store = new IdbStore(adapter.id);
+        const result = await captureToStore(adapter, store, sinceMs, untilMs, callbacks);
 
-        // 'ready' is the popup's signal to zip+clear (local) or just
-        // banner+clear (Miyo). User-Stop wipes everything; other
-        // aborts (paused, miyo_unavailable, etc.) leave the record so
-        // the user can Resume.
+        // 'ready' is the popup's signal to zip the buffer + clear.
+        // User-Stop wipes everything; other aborts (e.g. signed_out)
+        // leave the record so the user can Resume.
         if (result.kind === 'completed') {
           await updatePendingRun({
             status: 'ready',
@@ -490,7 +387,7 @@ chrome.runtime.onConnect.addListener((port) => {
             errors: result.errors,
           });
         } else if (result.reason === 'cancelled') {
-          if (mode === 'local') await clearItems(adapter.id);
+          await clearItems(adapter.id);
           await clearPendingRun();
         }
 

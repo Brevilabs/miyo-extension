@@ -1,29 +1,20 @@
 // Popup UI.
 //
-// Both modes share the same card shape: signed-in row → time-range
-// picker + action button. The mode only changes the button label
-// (Capture to Miyo vs Download) and where captured items land:
+// Each site card is a signed-in row → time-range picker + Download
+// button. Capture runs buffer into IndexedDB; on completion the popup
+// builds a zip from the buffer and triggers a download, then clears
+// the buffer. Stop drops the buffer (the buffer *is* the data, so
+// dropping it is the right "abandon" semantic).
 //
-//   • Miyo mode: items stream directly into the Miyo desktop app
-//     folder. Pause flushes pending_run for Resume; Stop is hidden
-//     (Discard from the paused state is the way to abandon, so the
-//     bookkeeping doesn't desync from items already POST'd to Miyo).
-//
-//   • Local mode: capture runs buffer into IndexedDB; on completion
-//     the popup builds a zip from the buffer and triggers a download,
-//     then clears the buffer. Stop drops the buffer (the buffer *is*
-//     the data, so dropping it is the right "abandon" semantic).
-//
-// At most one run pends across both modes. If a run is mid-capture
-// or completed-but-not-downloaded, other site cards are gated until
-// it's resolved. If the SW dies, the popup shows Resume on next
-// open and the capture continues from the same cursor.
+// At most one run pends at a time. If a run is mid-capture or
+// completed-but-not-downloaded, other site cards are gated until it's
+// resolved. If the SW dies, the popup shows Resume on next open and
+// the capture continues from the same cursor.
 //
 // Vanilla DOM. No framework — keeps the extension lean.
 
 import { DEFAULT_TIME_RANGE } from '../framework/types.js';
 import type {
-  CaptureMode,
   PopupSnapshot,
   SiteId,
   SiteRow,
@@ -42,7 +33,7 @@ type CaptureDone = {
   type: 'done';
   site: SiteId;
   result:
-    | { kind: 'completed'; mode: CaptureMode; written: number; errors: number }
+    | { kind: 'completed'; written: number; errors: number }
     | { kind: 'aborted'; reason: string };
 };
 
@@ -62,11 +53,6 @@ interface UIState {
   // Guards exportPendingAsZip against double-trigger (done broadcast
   // + open-time auto-zip both arriving).
   zipping: boolean;
-  // Fast probe in flight — drives the header "Checking Miyo…" chip.
-  probingMiyo: boolean;
-  // User preference; toggling off makes the popup behave as local-
-  // mode even when Miyo desktop is reachable.
-  miyoEnabled: boolean;
 }
 
 const ui: UIState = {
@@ -78,25 +64,7 @@ const ui: UIState = {
   banner: null,
   ranges: {},
   zipping: false,
-  probingMiyo: true,
-  miyoEnabled: true,
 };
-
-const MIYO_ENABLED_KEY = 'miyo_enabled';
-
-async function loadMiyoEnabled(): Promise<boolean> {
-  try {
-    const obj = await chrome.storage.local.get(MIYO_ENABLED_KEY);
-    const v = obj[MIYO_ENABLED_KEY];
-    return v !== false; // default true; only explicit false disables
-  } catch {
-    return true;
-  }
-}
-
-function saveMiyoEnabled(): void {
-  void chrome.storage.local.set({ [MIYO_ENABLED_KEY]: ui.miyoEnabled });
-}
 
 const RANGES_STORAGE_KEY = 'time_ranges';
 
@@ -214,11 +182,7 @@ function findSite(siteId: SiteId): SiteRow | null {
 // Rendering
 // ──────────────────────────────────────────────────────────────────
 
-const REFRESH_ICON = `<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 8a6 6 0 1 1-1.76-4.24"/><path d="M14 2.5v3.5h-3.5"/></svg>`;
-
 const DOWNLOAD_ICON = `<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 2v8.5"/><path d="M4.5 7.5L8 11l3.5-3.5"/><path d="M3 13.5h10"/></svg>`;
-
-const MIYO_INSTALL_URL = 'https://www.miyo.md/';
 
 function siteStatus(s: SiteRow, isCapturing: boolean): { cls: string; text: string } {
   if (isCapturing) return { cls: 'status-syncing', text: 'Capturing' };
@@ -247,9 +211,6 @@ function renderProgress(): string {
 }
 
 function renderSiteRow(s: SiteRow): string {
-  // miyoMode: show Miyo UI for this card. Both gates must be true —
-  // Miyo desktop is reachable AND the user hasn't toggled it off.
-  const miyoMode = ui.snapshot?.miyo_connected === true && ui.miyoEnabled;
   const isCapturing = ui.capturing === s.id;
   const anyBusy = ui.capturing !== null;
   const brand = brandFor(s.id, s.label);
@@ -280,28 +241,19 @@ function renderSiteRow(s: SiteRow): string {
         <button class="primary-button" data-action="open-site" data-site="${escape(s.id)}">Sign in to ${escape(s.label)} →</button>
       </div>`;
   } else {
-    const captureAction = miyoMode ? 'capture-miyo' : 'capture-local';
-    const actionIcon = miyoMode ? REFRESH_ICON : DOWNLOAD_ICON;
-    const actionLabel = miyoMode ? 'Capture to Miyo' : 'Download';
-
+    // Stop drops the IndexedDB buffer mid-run — the buffer *is* the
+    // data, so dropping it is the right "abandon" semantic.
     let actionHtml: string;
     if (isCapturing) {
-      // Miyo mode: Pause only. A hard Stop would clear the run record
-      // mid-flight while items already POST'd stay in Miyo — the
-      // bookkeeping desyncs from reality. Local mode keeps Stop
-      // because its zip buffer *is* the data: Stop drops the buffer,
-      // which is what "abandon" should do.
-      actionHtml = miyoMode
-        ? `<button class="link-button" data-action="pause" data-site="${escape(s.id)}">Pause</button>`
-        : `<button class="link-button link-button-danger" data-action="cancel" data-site="${escape(s.id)}">Stop</button>`;
+      actionHtml = `<button class="link-button link-button-danger" data-action="cancel" data-site="${escape(s.id)}">Stop</button>`;
     } else if (isPaused) {
       actionHtml = `
-        <button class="primary-button refresh-button site-range-action" data-action="resume" data-site="${escape(s.id)}">${actionIcon}<span>Resume (${pending.written})</span></button>
+        <button class="primary-button refresh-button site-range-action" data-action="resume" data-site="${escape(s.id)}">${DOWNLOAD_ICON}<span>Resume (${pending.written})</span></button>
         <button class="link-button link-button-danger" data-action="discard" data-site="${escape(s.id)}">Discard</button>`;
     } else if (otherOwnsPending) {
-      actionHtml = `<button class="primary-button refresh-button site-range-action" disabled>${actionIcon}<span>${actionLabel}</span></button>`;
+      actionHtml = `<button class="primary-button refresh-button site-range-action" disabled>${DOWNLOAD_ICON}<span>Download</span></button>`;
     } else {
-      actionHtml = `<button class="primary-button refresh-button site-range-action" data-action="${captureAction}" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>${actionIcon}<span>${actionLabel}</span></button>`;
+      actionHtml = `<button class="primary-button refresh-button site-range-action" data-action="capture-local" data-site="${escape(s.id)}" ${anyBusy ? 'disabled' : ''}>${DOWNLOAD_ICON}<span>Download</span></button>`;
     }
 
     const range = ownsPending ? pending.range : getRange(s.id, '30d');
@@ -377,33 +329,13 @@ function renderRangePicker(
 }
 
 function renderHeader(): string {
-  const miyoConnected = ui.snapshot?.miyo_connected === true;
-  const miyoActive = miyoConnected && ui.miyoEnabled;
-  let miyoBadge: string;
-  if (ui.probingMiyo) {
-    miyoBadge = `<div class="miyo-indicator miyo-checking">● Checking Miyo…</div>`;
-  } else if (miyoConnected) {
-    // Switch-style toggle; clicking it flips miyoEnabled.
-    miyoBadge = `
-      <button class="miyo-toggle" data-action="toggle-miyo" aria-pressed="${ui.miyoEnabled}">
-        <span class="miyo-toggle-track${ui.miyoEnabled ? ' on' : ''}"><span class="miyo-toggle-thumb"></span></span>
-        <span class="miyo-toggle-label">Miyo</span>
-      </button>`;
-  } else {
-    miyoBadge = '';
-  }
   return `
     <div class="pop-head">
       <div>
         <span class="pop-wordmark">miyo</span><span class="pop-wordmark-sub">capture</span>
       </div>
-      ${miyoBadge}
     </div>
-    <p class="pop-tagline">${
-      miyoActive
-        ? 'Your Miyo library, kept in sync.'
-        : 'Save your AI conversations as local markdown.'
-    }</p>
+    <p class="pop-tagline">Save your AI conversations as local markdown.</p>
   `;
 }
 
@@ -413,24 +345,6 @@ function renderFooter(): string {
       <span class="pop-foot-tag">yours, on your machine</span>
       <span class="pop-ver">v${escape(chrome.runtime.getManifest().version)}</span>
     </div>
-  `;
-}
-
-function renderMiyoPromo(): string {
-  // Don't claim Miyo is missing until the fast probe has resolved —
-  // the cached snapshot may be stale.
-  if (ui.probingMiyo) return '';
-  // If Miyo is reachable, never show the install promo — even if the
-  // user has toggled off, they've already installed it.
-  if (ui.snapshot?.miyo_connected === true) return '';
-  return `
-    <a class="miyo-promo" data-action="install-miyo" href="${escape(MIYO_INSTALL_URL)}" target="_blank" rel="noopener noreferrer">
-      <div class="miyo-promo-text">
-        <strong>Install Miyo</strong>
-        <span>Sync captures to a real library — search, link, and organize.</span>
-      </div>
-      <span class="miyo-promo-arrow" aria-hidden="true">→</span>
-    </a>
   `;
 }
 
@@ -448,7 +362,6 @@ function render(): void {
         ? `<div class="pop-banner ${ui.banner.kind === 'error' ? 'pop-banner-error' : 'pop-banner-info'}">${escape(ui.banner.text)}</div>`
         : ''
     }
-    ${renderMiyoPromo()}
     <div class="site-list">
       ${sites.map(renderSiteRow).join('')}
     </div>
@@ -459,13 +372,10 @@ function render(): void {
     btn.addEventListener('click', () => {
       const action = btn.dataset.action;
       const site = btn.dataset.site as SiteId | undefined;
-      if (action === 'capture-local' && site) void onCapture(site, 'local');
-      else if (action === 'capture-miyo' && site) void onCapture(site, 'miyo');
+      if (action === 'capture-local' && site) onCapture(site);
       else if (action === 'cancel' && site) onCancel(site);
-      else if (action === 'pause' && site) onPause(site);
       else if (action === 'resume') void onResume();
       else if (action === 'discard') void onDiscard();
-      else if (action === 'toggle-miyo') onToggleMiyo();
       else if (action === 'open-site' && site) onOpenSite(site);
     });
   });
@@ -536,7 +446,7 @@ function onRangeCustomDateChange(
 // Actions
 // ──────────────────────────────────────────────────────────────────
 
-function onCapture(siteId: SiteId, mode: CaptureMode): void {
+function onCapture(siteId: SiteId): void {
   ui.banner = null;
   ui.capturing = siteId;
   ui.captureProgress = { phase: 'listing', completed: 0, total: null };
@@ -544,16 +454,12 @@ function onCapture(siteId: SiteId, mode: CaptureMode): void {
   ui.capturePort = port;
   render();
   const range: TimeRange = getRange(siteId, '30d');
-  port.postMessage({ type: 'start', site: siteId, mode, range });
+  port.postMessage({ type: 'start', site: siteId, range });
   wirePort(port, siteId);
 }
 
 function onCancel(siteId: SiteId): void {
   ui.capturePort?.postMessage({ type: 'cancel', site: siteId });
-}
-
-function onPause(siteId: SiteId): void {
-  ui.capturePort?.postMessage({ type: 'pause', site: siteId });
 }
 
 function onResume(): void {
@@ -590,12 +496,6 @@ function onDiscard(): void {
 function onOpenSite(siteId: SiteId): void {
   const site = findSite(siteId);
   if (site) void chrome.tabs.create({ url: site.home_url });
-}
-
-function onToggleMiyo(): void {
-  ui.miyoEnabled = !ui.miyoEnabled;
-  saveMiyoEnabled();
-  render();
 }
 
 // Single-shot guarded by ui.zipping — fired both on 'done' and on
@@ -673,25 +573,9 @@ function wirePort(port: chrome.runtime.Port, siteId: SiteId): void {
       ui.capturePort = null;
       port.disconnect();
       if (done.result.kind === 'completed') {
-        const { written, errors, mode } = done.result;
-        if (mode === 'miyo') {
-          ui.banner = {
-            kind: 'info',
-            text:
-              written === 0
-                ? 'Nothing new to send. Miyo is up to date.'
-                : errors > 0
-                  ? `Sent ${written} to Miyo (${errors} failed).`
-                  : `Sent ${written} to Miyo.`,
-          };
-          // Miyo mode: items are already on disk. Just clear the
-          // pending_run record and refresh.
-          void clearPendingRun().then(() => refresh());
-        } else {
-          void exportPendingAsZip(done.site);
-        }
+        void exportPendingAsZip(done.site);
       } else {
-        const benign = done.result.reason === 'cancelled' || done.result.reason === 'paused';
+        const benign = done.result.reason === 'cancelled';
         ui.banner = {
           kind: benign ? 'info' : 'error',
           text: explainAbort(done.result.reason),
@@ -714,8 +598,6 @@ function explainAbort(reason: string): string {
   switch (reason) {
     case 'cancelled':
       return 'Capture stopped.';
-    case 'paused':
-      return 'Capture paused. Resume to continue.';
     case 'signed_out':
       return 'You are signed out. Sign in and try again.';
     case 'busy':
@@ -724,8 +606,6 @@ function explainAbort(reason: string): string {
       return 'A previous capture is pending — resolve it first.';
     case 'no_pending_run':
       return 'No pending capture to resume.';
-    case 'miyo_unavailable':
-      return 'Lost connection to Miyo. Reopen the popup to retry.';
     default:
       return `Capture stopped: ${reason}`;
   }
@@ -741,14 +621,12 @@ function attachToRunningRun(siteId: SiteId): void {
 }
 
 async function refresh(): Promise<void> {
-  ui.probingMiyo = true;
   render();
   try {
     ui.snapshot = (await chrome.runtime.sendMessage({ type: 'snapshot' })) as PopupSnapshot;
   } catch (err) {
     ui.banner = { kind: 'error', text: err instanceof Error ? err.message : String(err) };
   } finally {
-    ui.probingMiyo = false;
     render();
   }
 }
@@ -770,20 +648,15 @@ async function loadCachedSnapshot(): Promise<PopupSnapshot | null> {
 async function init(): Promise<void> {
   render();
 
-  const [cached, ranges, miyoEnabled] = await Promise.all([
-    loadCachedSnapshot(),
-    loadRanges(),
-    loadMiyoEnabled(),
-  ]);
+  const [cached, ranges] = await Promise.all([loadCachedSnapshot(), loadRanges()]);
   ui.ranges = ranges;
-  ui.miyoEnabled = miyoEnabled;
   if (cached) {
     ui.snapshot = cached;
     ui.initializing = false;
     render();
-    // Attach to any in-flight capture without blocking the fresh probe.
-    // If the SW isn't actually running it (paused), it replies
-    // 'not_running' and the popup flips to the paused render.
+    // Attach to any in-flight capture. If the SW isn't actually
+    // running it (it was killed mid-run), it replies 'not_running'
+    // and the popup flips to the Resume render.
     if (cached.pending_run?.status === 'capturing' && ui.capturing === null) {
       attachToRunningRun(cached.pending_run.siteId);
     }
@@ -800,20 +673,14 @@ async function init(): Promise<void> {
     }
   } finally {
     ui.initializing = false;
-    ui.probingMiyo = false;
     render();
   }
 
-  // Capture completed while the popup was closed. For local mode, zip
-  // + clear; for Miyo mode, files are already on the Miyo server, so
-  // just clear the pending_run record and refresh.
+  // Capture completed while the popup was closed: zip the buffer and
+  // download, then clear.
   const pending = ui.snapshot?.pending_run;
   if (pending && pending.status === 'ready' && !ui.zipping) {
-    if (pending.mode === 'miyo') {
-      void clearPendingRun().then(() => refresh());
-    } else {
-      void exportPendingAsZip(pending.siteId);
-    }
+    void exportPendingAsZip(pending.siteId);
   }
 }
 

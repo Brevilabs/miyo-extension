@@ -1,10 +1,9 @@
 // Capture orchestrator.
 //
-// One mode-agnostic loop drives both flows. It walks the adapter's
-// list pages newest-first, bulk-checks the destination store for
-// which item ids are already present, and captures the missing ones.
-// Local mode → IdbStore (buffered, zipped+downloaded by popup at end).
-// Miyo mode  → MiyoStore (files POST'd to the Miyo desktop server).
+// The loop walks the adapter's list pages newest-first, bulk-checks
+// the store for which item ids are already present, and captures the
+// missing ones into the IdbStore buffer that the popup zips and
+// downloads at the end.
 //
 // Range semantics:
 //   sinceMs   → stop when an item's updated_at falls below it.
@@ -25,9 +24,7 @@ import { FatalError, paced } from './rate-limit.js';
 import { renderChatConversationMarkdown } from './chat.js';
 import { readPendingRun, updatePendingRun } from './run-state.js';
 import { makeDatePrefixedFilename } from './filename.js';
-import { MiyoUnavailableError } from './miyo.js';
 import type {
-  CaptureMode,
   CapturedItem,
   ListItem,
   RenderedItem,
@@ -40,10 +37,9 @@ import type { Store } from './capture-store.js';
 // corrects on its first flush.
 const RUN_FLUSH_EVERY = 10;
 
-// 'cancelled' is the hard halt — pending_run is dropped. 'paused' is
-// the soft one — state is flushed and Resume picks up at the same
-// cursor.
-export type StopReason = 'cancelled' | 'paused';
+// 'cancelled' is the hard halt — pending_run is dropped and the
+// buffered items are discarded.
+export type StopReason = 'cancelled';
 
 export interface CaptureCallbacks {
   onProgress: (p: {
@@ -56,7 +52,7 @@ export interface CaptureCallbacks {
 }
 
 export type CaptureResult =
-  | { kind: 'completed'; mode: CaptureMode; written: number; errors: number }
+  | { kind: 'completed'; written: number; errors: number }
   | { kind: 'aborted'; reason: string };
 
 async function renderForAdapter(
@@ -104,7 +100,6 @@ function errMessage(err: unknown): string {
 export async function captureToStore(
   adapter: SiteAdapter,
   store: Store,
-  mode: CaptureMode,
   sinceMs: number | null,
   untilMs: number | null,
   callbacks: CaptureCallbacks
@@ -171,9 +166,6 @@ export async function captureToStore(
         missing = await store.filterMissing(inRange.map((i) => i.id));
       } catch (err) {
         await flush();
-        if (err instanceof MiyoUnavailableError) {
-          return { kind: 'aborted', reason: 'miyo_unavailable' };
-        }
         return { kind: 'aborted', reason: errMessage(err) };
       }
     }
@@ -205,10 +197,6 @@ export async function captureToStore(
           await flush();
           return { kind: 'aborted', reason: 'signed_out' };
         }
-        if (err instanceof MiyoUnavailableError) {
-          await flush();
-          return { kind: 'aborted', reason: 'miyo_unavailable' };
-        }
         errors += 1;
       }
       unflushed += 1;
@@ -229,5 +217,5 @@ export async function captureToStore(
   }
 
   await flush();
-  return { kind: 'completed', mode, written, errors };
+  return { kind: 'completed', written, errors };
 }

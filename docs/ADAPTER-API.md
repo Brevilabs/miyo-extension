@@ -121,23 +121,16 @@ export const ADAPTERS: SiteAdapter[] = [chatgptAdapter, claudeAdapter, myAdapter
 And add the host(s) to `public/manifest.json` under
 `host_permissions`.
 
-## Display metadata (for the Miyo desktop)
+## Display metadata
 
-The fields `home_url`, `brand_color`, and `icon_data_url` are
-forwarded to the Miyo desktop on every `sync/start`. Desktop caches
-the latest values per `source_id` and uses them to render the source
-in the Synced apps view — **no desktop release is needed for a new
-adapter to appear in the UI**.
+These fields drive how the popup renders the site card and what lands
+in the markdown frontmatter.
 
 - **`home_url`** (required). The site's home page. Used as the
-  link target in the desktop's per-source row and in the standalone
-  folder README.
+  "open ChatGPT / Claude" link target when the user is signed out.
 - **`brand_color`** (optional). Hex color (e.g. `'#10a37f'`). Used
-  for the chip/glyph background. Pick the site's primary brand
-  color or omit and let the desktop use a neutral default.
-- **`icon_data_url`** (optional). An inline SVG as a `data:` URL,
-  if the site has a recognizable mark. Omit and the desktop falls
-  back to a generic glyph + the source label.
+  for the card's chip/glyph background and recorded in frontmatter.
+  Pick the site's primary brand color or omit for a neutral default.
 
 ## Framework helpers (for custom adapters)
 
@@ -169,11 +162,10 @@ share conventions can.
 - **Pacing.** Every adapter call goes through a per-site rate
   limiter with a 1.5s floor between requests. You cannot opt out.
 
-- **Delivery.** Don't touch the file system. The framework hands the
-  body (chat-rendered or custom-rendered) to whichever transport is
-  active for the run: Miyo HTTP when the desktop is running, or the
-  local IndexedDB buffer otherwise. The user explicitly exports the
-  buffer to a zip via the popup.
+- **Delivery.** Don't touch the file system. The framework buffers
+  the body (chat-rendered or custom-rendered) into IndexedDB. When
+  the run completes the popup builds a ZIP from the buffer and the
+  user downloads it.
 
 - **Idempotency and renames.** Same item id with same content state
   must produce the same filename. Re-fetches overwrite the existing
