@@ -187,7 +187,7 @@ const DOWNLOAD_ICON = `<svg width="12" height="12" viewBox="0 0 16 16" fill="non
 function siteStatus(s: SiteRow, isCapturing: boolean): { cls: string; text: string } {
   if (isCapturing) return { cls: 'status-syncing', text: 'Capturing' };
   if (!s.session) return { cls: 'status-off', text: 'Checking…' };
-  if (!s.session.signedIn) return { cls: 'status-warn', text: 'Sign in' };
+  if (!s.session.signedIn) return { cls: 'status-warn', text: 'Not signed in' };
   return { cls: 'status-ready', text: 'Ready' };
 }
 
@@ -216,14 +216,6 @@ function renderSiteRow(s: SiteRow): string {
   const brand = brandFor(s.id, s.label);
   const status = siteStatus(s, isCapturing);
   const cardStyle = `--svc-color:${brand.color};--svc-color-soft:${brand.soft};`;
-
-  // Account line. The signed-in account email is deliberately not
-  // shown — it is sensitive and the UI only needs sign-in state.
-  const accountLine = s.session?.signedIn
-    ? `<span class="site-account">signed in</span>`
-    : s.session
-      ? `<span class="site-account">not signed in</span>`
-      : '';
 
   const pending = ui.snapshot?.pending_run ?? null;
   const ownsPending = pending !== null && pending.siteId === s.id;
@@ -269,7 +261,7 @@ function renderSiteRow(s: SiteRow): string {
       <div class="site-card-head">
         <div class="site-logo">${escape(brand.initial)}</div>
         <div class="site-title">
-          <div class="site-name">${escape(s.label)}${accountLine}</div>
+          <div class="site-name">${escape(s.label)}</div>
         </div>
         <span class="status-pill site-status ${status.cls}">${escape(status.text)}</span>
       </div>
