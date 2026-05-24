@@ -1,3 +1,5 @@
+<img src="public/icons/icon-128.png" alt="Miyo Capture icon" width="72" align="left" hspace="12" />
+
 # Miyo Capture
 
 > Capture your AI chats as markdown. Yours, on your machine.
