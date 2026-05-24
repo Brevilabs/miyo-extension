@@ -217,11 +217,10 @@ function renderSiteRow(s: SiteRow): string {
   const status = siteStatus(s, isCapturing);
   const cardStyle = `--svc-color:${brand.color};--svc-color-soft:${brand.soft};`;
 
-  // Account line.
+  // Account line. The signed-in account email is deliberately not
+  // shown — it is sensitive and the UI only needs sign-in state.
   const accountLine = s.session?.signedIn
-    ? s.session.email
-      ? `<span class="site-account">${escape(s.session.email)}</span>`
-      : `<span class="site-account">signed in</span>`
+    ? `<span class="site-account">signed in</span>`
     : s.session
       ? `<span class="site-account">not signed in</span>`
       : '';

@@ -97,7 +97,10 @@ async function buildRow(adapter: SiteAdapter): Promise<SiteRow> {
     label: adapter.label,
     home_url: adapter.home_url,
     brand_color: adapter.brand_color ?? null,
-    session,
+    // Drop the account email before it enters the popup snapshot — it
+    // is sensitive and unused by the UI, and the snapshot is persisted
+    // to chrome.storage.local.
+    session: { signedIn: session.signedIn, email: null },
   };
 }
 
