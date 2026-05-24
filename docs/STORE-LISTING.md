@@ -28,7 +28,7 @@ Pick a time range, click Download, and the extension gathers your matching conve
 • ChatGPT — full conversation history: titles, timestamps, and messages.
 • Claude (claude.ai) — full conversation history.
 
-Each conversation becomes one markdown file with YAML frontmatter (platform, title, URL, created/updated dates) and the full back-and-forth, grouped turn by turn.
+Each conversation is saved as its own file — the full back-and-forth, organized turn by turn, with the title, original link, and dates kept neatly at the top.
 
 — PRIVATE BY DESIGN —
 • Local only. Your conversations are read and packaged entirely on your device and downloaded straight to your computer. Nothing is ever sent to us or to any server.
