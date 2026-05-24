@@ -171,15 +171,17 @@ export async function captureToStore(
     }
     const missingSet = new Set(missing);
 
-    // Concrete first-page note so the popup isn't stuck on the
-    // generic "Looking for new conversations…" through the first
-    // ~1.5s item fetch.
+    // Bridge note so the popup isn't stuck on the generic "Looking
+    // for new conversations…" through the first ~1.5s item fetch. No
+    // count here — missing.length is only this page's new items, not
+    // the run total, so a number would undercount and contradict the
+    // live "N captured" counter that follows.
     if (!firstPageProcessed && missing.length > 0) {
       callbacks.onProgress({
         phase: 'listing',
         completed: 0,
         total: null,
-        note: `Found ${missing.length} new, fetching…`,
+        note: 'Capturing new conversations…',
       });
     }
     firstPageProcessed = true;
