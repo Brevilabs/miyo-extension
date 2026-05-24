@@ -1,6 +1,6 @@
 {
   "name": "miyo-capture",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Capture your AI chats (ChatGPT, Claude) as local markdown in a folder you choose. Use them with Miyo, Obsidian, or any tool that reads markdown.",
   "private": true,
   "license": "MIT",
