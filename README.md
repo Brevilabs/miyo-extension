@@ -15,6 +15,10 @@ one conversation per file — straight to your Downloads folder.
 The output is plain markdown — open it in **Obsidian**, **Logseq**,
 your editor, or `grep`. Nothing locks you in.
 
+<p align="center">
+  <img src="docs/popup.png" alt="Miyo Capture popup — one card per site with a time-range picker and a Download button" width="420" />
+</p>
+
 ## Install
 
 - **Browser extension store** — *coming soon.*
