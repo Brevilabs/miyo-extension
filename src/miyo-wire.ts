@@ -1,7 +1,11 @@
-// Wire shapes and pure helpers for the Miyo Desktop local service
-// (http://127.0.0.1:8742). Chrome-free on purpose: this module is
+// Wire shapes and pure helpers for the Miyo Desktop native-messaging
+// host (`md.miyo.chatsync`). Chrome-free on purpose: this module is
 // shared by the service worker, the popup, and the node:test unit
 // tests (see tsconfig.test.json).
+//
+// The desktop installs a native-messaging host the extension talks to
+// over chrome.runtime.connectNative / sendNativeMessage. Chrome frames
+// each message (4-byte length prefix); we only deal in plain JSON.
 
 // Platforms the desktop chat-sync understands. These match the
 // extension's adapter ids (src/adapters/) byte-for-byte.
@@ -26,21 +30,61 @@ export interface CookieLike {
   expirationDate?: number;
 }
 
-export interface MiyoCookiesBody {
-  version: 1;
+// ──────────────────────────────────────────────────────────────────
+// Native-messaging envelopes
+// ──────────────────────────────────────────────────────────────────
+
+// Messages the extension sends to the host. Chrome handles framing;
+// these are the plain JSON payloads.
+export interface MiyoPingMessage {
+  type: 'ping';
+}
+
+export interface MiyoStatusMessage {
+  type: 'status';
+}
+
+export interface MiyoPushCookiesMessage {
+  type: 'push_cookies';
   platform: MiyoPlatform;
   cookies: CookieLike[];
   captured_at: number; // ms epoch
 }
 
-// POST /v0/chats/cookies request body.
-export function buildCookiesBody(
+export type MiyoOutboundMessage =
+  | MiyoPingMessage
+  | MiyoStatusMessage
+  | MiyoPushCookiesMessage;
+
+// Host replies.
+export interface MiyoPingReply {
+  ok: true;
+  running: boolean;
+}
+
+export interface MiyoStatusReply {
+  ok: boolean;
+  status?: MiyoChatsStatus;
+}
+
+// push_cookies reply: { ok: true } on success, or
+// { ok: false, reason: 'miyo_not_running' | 'rejected' | ... }.
+export interface MiyoPushReply {
+  ok: boolean;
+  reason?: string;
+}
+
+// The `push_cookies` payload the host expects. Pure mapper: strips the
+// extra fields chrome.cookies attaches (httpOnly, secure, session, …)
+// down to the four the host reads, dropping expirationDate for session
+// cookies.
+export function buildPushCookiesMessage(
   platform: MiyoPlatform,
   cookies: CookieLike[],
   capturedAt: number
-): MiyoCookiesBody {
+): MiyoPushCookiesMessage {
   return {
-    version: 1,
+    type: 'push_cookies',
     platform,
     cookies: cookies.map((c) => ({
       name: c.name,
@@ -65,7 +109,7 @@ export function platformForCookieDomain(domain: string): MiyoPlatform | null {
   return null;
 }
 
-// GET /v0/chats/status response.
+// `status` payload the host returns for a { type: 'status' } message.
 export type MiyoSyncState =
   | 'not_connected'
   | 'waiting_for_browser'

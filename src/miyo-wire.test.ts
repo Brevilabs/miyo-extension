@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  buildCookiesBody,
+  buildPushCookiesMessage,
   platformForCookieDomain,
   syncStateCopy,
   syncStatePill,
@@ -10,10 +10,10 @@ import {
 } from './miyo-wire.js';
 
 // ---------------------------------------------------------------------------
-// buildCookiesBody
+// buildPushCookiesMessage
 // ---------------------------------------------------------------------------
 
-test('builds the POST /v0/chats/cookies body shape', () => {
+test('builds the push_cookies native message shape', () => {
   const cookies: CookieLike[] = [
     {
       name: '__Secure-next-auth.session-token',
@@ -23,9 +23,9 @@ test('builds the POST /v0/chats/cookies body shape', () => {
       expirationDate: 1_780_000_000,
     },
   ];
-  const body = buildCookiesBody('chatgpt', cookies, 1_750_000_000_000);
-  assert.deepEqual(body, {
-    version: 1,
+  const msg = buildPushCookiesMessage('chatgpt', cookies, 1_750_000_000_000);
+  assert.deepEqual(msg, {
+    type: 'push_cookies',
     platform: 'chatgpt',
     cookies: [
       {
@@ -41,12 +41,12 @@ test('builds the POST /v0/chats/cookies body shape', () => {
 });
 
 test('omits expirationDate for session cookies', () => {
-  const body = buildCookiesBody(
+  const msg = buildPushCookiesMessage(
     'claude_ai',
     [{ name: 'sessionKey', value: 'v', domain: 'claude.ai', path: '/' }],
     1
   );
-  assert.equal(Object.prototype.hasOwnProperty.call(body.cookies[0], 'expirationDate'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(msg.cookies[0], 'expirationDate'), false);
 });
 
 test('strips extra cookie fields chrome attaches (httpOnly, secure, …)', () => {
@@ -60,8 +60,8 @@ test('strips extra cookie fields chrome attaches (httpOnly, secure, …)', () =>
     session: false,
     storeId: '0',
   };
-  const body = buildCookiesBody('chatgpt', [chromeCookie as CookieLike], 1);
-  assert.deepEqual(Object.keys(body.cookies[0]!).sort(), ['domain', 'name', 'path', 'value']);
+  const msg = buildPushCookiesMessage('chatgpt', [chromeCookie as CookieLike], 1);
+  assert.deepEqual(Object.keys(msg.cookies[0]!).sort(), ['domain', 'name', 'path', 'value']);
 });
 
 // ---------------------------------------------------------------------------

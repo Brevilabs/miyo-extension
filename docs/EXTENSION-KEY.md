@@ -3,9 +3,12 @@
 `public/manifest.json` carries a `"key"` field — the base64 DER-encoded RSA
 public key — so the extension ID is the same everywhere (unpacked dev loads,
 CI builds, and the Chrome Web Store listing). Miyo Desktop pins this ID: the
-local service only accepts `POST /v0/chats/cookies` from allow-listed
-`chrome-extension://` origins (`MIYO_EXTENSION_ORIGINS`), so the ID must not
-drift between builds.
+desktop's native-messaging host manifest (`md.miyo.chatsync`) lists this
+extension in its `allowed_origins`
+(`["chrome-extension://pmkapnocjgmigkeffplajjfbcmhmjfde/"]`). Chrome only lets
+an extension connect to a native host whose manifest allow-lists its origin,
+so the ID must not drift between builds — otherwise the host connection is
+refused.
 
 - **Extension ID:** `pmkapnocjgmigkeffplajjfbcmhmjfde`
 - **Origin:** `chrome-extension://pmkapnocjgmigkeffplajjfbcmhmjfde`

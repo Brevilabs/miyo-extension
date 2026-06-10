@@ -25,7 +25,8 @@
   },
   "permissions": [
     "storage",
-    "alarms"
+    "alarms",
+    "nativeMessaging"
   ],
   "optional_permissions": [
     "cookies"
@@ -34,7 +35,6 @@
     "https://chatgpt.com/*",
     "https://*.chatgpt.com/*",
     "https://claude.ai/*",
-    "https://*.claude.ai/*",
-    "http://127.0.0.1:8742/*"
+    "https://*.claude.ai/*"
   ]
 }

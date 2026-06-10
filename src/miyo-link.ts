@@ -1,4 +1,4 @@
-// Link to the Miyo Desktop local service (http://127.0.0.1:8742).
+// Link to the Miyo Desktop native-messaging host (`md.miyo.chatsync`).
 //
 // When the user flips "Sync to Miyo Desktop" on, the extension pushes
 // the ChatGPT / Claude session cookies to the desktop app, which then
@@ -6,59 +6,90 @@
 // extension's job is only cookie delivery + status display; no chat
 // data flows through the extension in this mode.
 //
+// Transport is Chrome native messaging: the desktop installs a host
+// named `md.miyo.chatsync` whose native-messaging manifest allow-lists
+// this extension's (pinned) ID. There is no loopback port to probe —
+// the host fails closed, replying { ok: false, reason: 'miyo_not_running' }
+// when the real Miyo service isn't reachable.
+//
 // Push triggers: SW init / browser startup, a 30-minute alarm, and
 // cookie changes on the two sites (debounced ~5s per platform). Every
-// push is fire-and-forget: if Miyo isn't running the fetch fails and
+// push is fire-and-forget: if Miyo isn't running the host rejects and
 // we silently wait for the next trigger.
 //
 // The `cookies` permission is optional (requested by the popup the
 // first time the toggle is enabled) so a default install shows no
-// cookie warning.
+// cookie warning. The `nativeMessaging` permission is required (in
+// manifest.json) so both the SW and the popup can call the host.
 
 import {
-  buildCookiesBody,
+  buildPushCookiesMessage,
   platformForCookieDomain,
   MIYO_PLATFORMS,
   MIYO_PLATFORM_DOMAINS,
   type MiyoChatsStatus,
+  type MiyoOutboundMessage,
+  type MiyoPingReply,
   type MiyoPlatform,
+  type MiyoPushReply,
+  type MiyoStatusReply,
 } from './miyo-wire.js';
 
-export const MIYO_BASE_URL = 'http://127.0.0.1:8742';
+export const MIYO_HOST_NAME = 'md.miyo.chatsync';
 export const MIYO_SYNC_ENABLED_KEY = 'miyo_sync_enabled';
 
 const SYNC_ALARM = 'miyo-sync-push';
 const SYNC_ALARM_PERIOD_MINUTES = 30;
-const PROBE_TIMEOUT_MS = 1500;
 const COOKIE_CHANGE_DEBOUNCE_MS = 5000;
 
 // ──────────────────────────────────────────────────────────────────
-// HTTP (also imported by the popup — no chrome.* in these two)
+// Native-messaging transport (also imported by the popup — popups may
+// call chrome.runtime.sendNativeMessage once nativeMessaging is granted)
 // ──────────────────────────────────────────────────────────────────
 
-// Is Miyo Desktop running? Short timeout so the popup never hangs on
-// a machine without Miyo installed.
-export async function probeMiyo(timeoutMs = PROBE_TIMEOUT_MS): Promise<boolean> {
-  try {
-    const res = await fetch(`${MIYO_BASE_URL}/v0/health`, {
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
+// Reply shape when the host couldn't be reached at all (not installed,
+// failed to launch, …). chrome.runtime.lastError carries a message like
+// "Specified native messaging host not found" — we map that to a
+// uniform { ok: false, reason: 'no_host' } so callers never throw.
+interface NoHostReply {
+  ok: false;
+  reason: 'no_host';
+}
+
+// Promise wrapper around chrome.runtime.sendNativeMessage that resolves
+// (never rejects) with the host's reply, or { ok:false, reason:'no_host' }
+// when the host is missing / unreachable.
+function sendNativeMessage<T extends { ok: boolean }>(
+  message: MiyoOutboundMessage
+): Promise<T | NoHostReply> {
+  return new Promise((resolve) => {
+    try {
+      chrome.runtime.sendNativeMessage(MIYO_HOST_NAME, message, (reply: unknown) => {
+        if (chrome.runtime.lastError || reply == null) {
+          resolve({ ok: false, reason: 'no_host' });
+          return;
+        }
+        resolve(reply as T);
+      });
+    } catch {
+      // Some Chrome builds throw synchronously when the host is absent.
+      resolve({ ok: false, reason: 'no_host' });
+    }
+  });
+}
+
+// Is Miyo Desktop running? `ping` returns { ok:true, running } when the
+// host is installed; a missing host (no_host) means Miyo isn't installed.
+// Either way we never throw — the popup must not hang.
+export async function probeMiyo(): Promise<boolean> {
+  const reply = await sendNativeMessage<MiyoPingReply>({ type: 'ping' });
+  return reply.ok === true && reply.running === true;
 }
 
 export async function fetchMiyoStatus(): Promise<MiyoChatsStatus | null> {
-  try {
-    const res = await fetch(`${MIYO_BASE_URL}/v0/chats/status`, {
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-    });
-    if (!res.ok) return null;
-    return (await res.json()) as MiyoChatsStatus;
-  } catch {
-    return null;
-  }
+  const reply = await sendNativeMessage<MiyoStatusReply>({ type: 'status' });
+  if (!reply.ok) return null;
+  return (reply as MiyoStatusReply).status ?? null;
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -79,27 +110,19 @@ export async function isMiyoSyncEnabled(): Promise<boolean> {
 // ──────────────────────────────────────────────────────────────────
 
 // Push one platform's cookies to Miyo. Silently no-ops when the
-// `cookies` permission isn't granted or Miyo isn't running — the next
-// trigger retries.
+// `cookies` permission isn't granted, the host is missing, or Miyo
+// isn't running — the next trigger retries.
 export async function pushCookies(platform: MiyoPlatform): Promise<void> {
   // chrome.cookies is undefined until the optional permission is
   // granted; its presence *is* the grant check.
   if (!chrome.cookies) return;
-  try {
-    // getAll({ domain }) matches the domain and all subdomains, so
-    // ".chatgpt.com" / "ab.chatgpt.com" cookies are included.
-    const cookies = await chrome.cookies.getAll({ domain: MIYO_PLATFORM_DOMAINS[platform] });
-    const body = buildCookiesBody(platform, cookies, Date.now());
-    await fetch(`${MIYO_BASE_URL}/v0/chats/cookies`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
-    });
-  } catch {
-    // Miyo not running (or transient failure) — the next alarm,
-    // cookie change, or SW start retries.
-  }
+  // getAll({ domain }) matches the domain and all subdomains, so
+  // ".chatgpt.com" / "ab.chatgpt.com" cookies are included.
+  const cookies = await chrome.cookies.getAll({ domain: MIYO_PLATFORM_DOMAINS[platform] });
+  const message = buildPushCookiesMessage(platform, cookies, Date.now());
+  // Fire-and-forget: on { ok:false } (miyo_not_running / rejected) or a
+  // missing host the next alarm, cookie change, or SW start retries.
+  await sendNativeMessage<MiyoPushReply>(message);
 }
 
 export async function pushAllCookies(): Promise<void> {
