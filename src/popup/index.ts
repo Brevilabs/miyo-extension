@@ -24,6 +24,14 @@ import type {
 import { clearItems, getAllItems } from '../framework/store.js';
 import { clearPendingRun } from '../framework/run-state.js';
 import { buildZip } from '../framework/zip.js';
+import { fetchMiyoStatus, probeMiyo, MIYO_SYNC_ENABLED_KEY } from '../miyo-link.js';
+import {
+  MIYO_PLATFORMS,
+  syncStateCopy,
+  syncStatePill,
+  type MiyoChatsStatus,
+  type MiyoPlatform,
+} from '../miyo-wire.js';
 
 // ──────────────────────────────────────────────────────────────────
 // Types & state
@@ -53,6 +61,12 @@ interface UIState {
   // Guards exportPendingAsZip against double-trigger (done broadcast
   // + open-time auto-zip both arriving).
   zipping: boolean;
+  miyo: {
+    // null while the health probe is in flight.
+    running: boolean | null;
+    enabled: boolean;
+    status: MiyoChatsStatus | null;
+  };
 }
 
 const ui: UIState = {
@@ -64,6 +78,7 @@ const ui: UIState = {
   banner: null,
   ranges: {},
   zipping: false,
+  miyo: { running: null, enabled: false, status: null },
 };
 
 const RANGES_STORAGE_KEY = 'time_ranges';
@@ -319,6 +334,134 @@ function renderRangePicker(
     ${customRow}`;
 }
 
+// ──────────────────────────────────────────────────────────────────
+// Miyo Desktop sync
+// ──────────────────────────────────────────────────────────────────
+
+// "Sync to Miyo Desktop" master toggle row, at the top of the popup.
+// Interactive only when the local Miyo service answers the health
+// probe; otherwise it degrades to a hint ("Miyo not running") when
+// sync was previously enabled, or a quiet install link when it never
+// was.
+function renderMiyoToggle(): string {
+  const { running, enabled } = ui.miyo;
+  const interactive = running === true;
+  const checked = enabled ? 'checked' : '';
+  const disabled = interactive ? '' : 'disabled';
+
+  let aside: string;
+  if (running === false && enabled) {
+    aside = `<span class="miyo-hint">Miyo not running</span>`;
+  } else if (running === false && !enabled) {
+    aside = `<a class="miyo-get-link" href="https://miyo.md" target="_blank" rel="noopener noreferrer">Get Miyo Desktop</a>`;
+  } else {
+    aside = '';
+  }
+
+  return `
+    <div class="miyo-card">
+      <label class="miyo-toggle-row">
+        <span class="miyo-toggle-label">Sync to Miyo Desktop</span>
+        ${aside}
+        <span class="miyo-switch">
+          <input type="checkbox" id="miyo-sync-toggle" ${checked} ${disabled} />
+          <span class="miyo-switch-track"></span>
+        </span>
+      </label>
+    </div>`;
+}
+
+const MIYO_PLATFORM_LABELS: Record<MiyoPlatform, string> = {
+  chatgpt: 'ChatGPT',
+  claude_ai: 'Claude',
+};
+
+// One compact, purely informational row per site. Shown instead of
+// the capture cards when sync is on and Miyo is reachable — syncing
+// happens in the background on the desktop, so there is nothing to
+// click.
+function renderMiyoStatusRow(platform: MiyoPlatform): string {
+  const label = MIYO_PLATFORM_LABELS[platform];
+  const brand = brandFor(platform, label);
+  const p = ui.miyo.status?.platforms[platform] ?? null;
+  const signedOut = findSite(platform)?.session?.signedIn === false;
+
+  const pillCls = p ? syncStatePill(p.state) : 'status-off';
+  const pillText = p ? syncStateCopy(p) : 'Checking…';
+  const sub = p?.email
+    ? `<div class="miyo-row-sub">${escape(p.email)}</div>`
+    : signedOut
+      ? `<div class="miyo-row-sub miyo-row-warn">Not signed in</div>`
+      : '';
+
+  return `
+    <div class="site-card miyo-row" style="--svc-color:${brand.color};--svc-color-soft:${brand.soft};">
+      <div class="site-card-head">
+        <div class="site-logo">${escape(brand.initial)}</div>
+        <div class="site-title">
+          <div class="site-name">${escape(label)}</div>
+          ${sub}
+        </div>
+        <span class="status-pill site-status ${pillCls}">${escape(pillText)}</span>
+      </div>
+    </div>`;
+}
+
+function renderMiyoStatusView(): string {
+  return `
+    <div class="site-list">
+      ${MIYO_PLATFORMS.map(renderMiyoStatusRow).join('')}
+    </div>
+    <div class="miyo-sync-note">Everything syncs automatically in the background.</div>`;
+}
+
+async function refreshMiyoStatus(): Promise<void> {
+  const status = await fetchMiyoStatus();
+  ui.miyo.status = status;
+  // The status endpoint vanishing means Miyo went away mid-popup.
+  if (status === null) ui.miyo.running = await probeMiyo();
+  render();
+}
+
+// Re-poll status while the popup is open so syncing counts stay
+// live. Started once, on whichever comes first: popup open with sync
+// already on, or the user flipping the toggle on.
+let miyoStatusPoller: ReturnType<typeof setInterval> | null = null;
+
+function startMiyoStatusPolling(): void {
+  if (miyoStatusPoller !== null) return;
+  miyoStatusPoller = setInterval(() => {
+    if (ui.miyo.enabled && ui.miyo.running === true) void refreshMiyoStatus();
+  }, 4000);
+}
+
+// `checked` is the state the user just asked for. Permission request
+// must run synchronously inside the user gesture, before any await.
+function onMiyoToggle(checked: boolean): void {
+  if (checked) {
+    void chrome.permissions
+      .request({ permissions: ['cookies'] })
+      .then(async (granted) => {
+        if (!granted) {
+          render(); // revert the visual toggle
+          return;
+        }
+        await chrome.runtime.sendMessage({ type: 'miyo-sync-set', enabled: true });
+        ui.miyo.enabled = true;
+        render();
+        void refreshMiyoStatus();
+        startMiyoStatusPolling();
+      })
+      .catch(() => render());
+  } else {
+    void (async () => {
+      await chrome.runtime.sendMessage({ type: 'miyo-sync-set', enabled: false });
+      ui.miyo.enabled = false;
+      render();
+    })();
+  }
+}
+
 function renderHeader(): string {
   return `
     <div class="pop-head">
@@ -348,18 +491,27 @@ function render(): void {
   }
   const sites = ui.snapshot?.sites ?? [];
 
+  // Sync mode replaces the capture UI with the informational status
+  // view; everything else (header, banner, footer) stays put.
+  const syncView = ui.miyo.enabled && ui.miyo.running === true;
+  const body = syncView
+    ? renderMiyoStatusView()
+    : `<div class="site-list">${sites.map(renderSiteRow).join('')}</div>`;
+
   root.innerHTML = `
     ${renderHeader()}
+    ${renderMiyoToggle()}
     ${
       ui.banner
         ? `<div class="pop-banner ${ui.banner.kind === 'error' ? 'pop-banner-error' : 'pop-banner-info'}">${escape(ui.banner.text)}</div>`
         : ''
     }
-    <div class="site-list">
-      ${sites.map(renderSiteRow).join('')}
-    </div>
+    ${body}
     ${renderFooter()}
   `;
+
+  const toggle = root.querySelector<HTMLInputElement>('#miyo-sync-toggle');
+  toggle?.addEventListener('change', () => onMiyoToggle(toggle.checked));
 
   root.querySelectorAll<HTMLButtonElement>('button[data-action]').forEach((btn) => {
     btn.addEventListener('click', () => {
@@ -633,6 +785,22 @@ async function loadCachedSnapshot(): Promise<PopupSnapshot | null> {
   }
 }
 
+// Load the persisted toggle state and probe the local Miyo service.
+// Runs off the paint path alongside the snapshot fetch.
+async function initMiyo(): Promise<void> {
+  const [stored, running] = await Promise.all([
+    chrome.storage.local.get(MIYO_SYNC_ENABLED_KEY),
+    probeMiyo(),
+  ]);
+  ui.miyo.enabled = stored[MIYO_SYNC_ENABLED_KEY] === true;
+  ui.miyo.running = running;
+  render();
+  if (ui.miyo.enabled && running) {
+    await refreshMiyoStatus();
+    startMiyoStatusPolling();
+  }
+}
+
 // Stale-while-revalidate: paint the cached snapshot immediately so
 // the popup feels instant, then kick off a fresh snapshot request in
 // the background and re-render when it lands. The fresh fetch can
@@ -640,6 +808,8 @@ async function loadCachedSnapshot(): Promise<PopupSnapshot | null> {
 // path means the user sees content right away.
 async function init(): Promise<void> {
   render();
+
+  void initMiyo();
 
   const [cached, ranges] = await Promise.all([loadCachedSnapshot(), loadRanges()]);
   ui.ranges = ranges;

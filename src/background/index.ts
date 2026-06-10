@@ -12,8 +12,13 @@
 //      shouldStop hook.
 //
 //   3. Badge animation while a run is in flight.
+//
+//   4. Miyo Desktop sync (src/miyo-link.ts). When enabled, session
+//      cookies are pushed to the local Miyo service on init, on a
+//      periodic alarm, and on cookie changes.
 
 import { ADAPTERS, getAdapter } from '../adapters/index.js';
+import { disableMiyoSync, enableMiyoSync, initMiyoLink } from '../miyo-link.js';
 import { captureToStore } from '../framework/capture.js';
 import { IdbStore } from '../framework/capture-store.js';
 import { clearItems } from '../framework/store.js';
@@ -155,6 +160,10 @@ function clearBadge(): void {
 // death. Clear it once at module load.
 clearBadge();
 
+// Miyo Desktop sync listeners — must register at module load so they
+// survive SW restarts.
+initMiyoLink();
+
 // ──────────────────────────────────────────────────────────────────
 // Capture run dispatch
 // ──────────────────────────────────────────────────────────────────
@@ -183,6 +192,12 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     try {
       if (msg?.type === 'snapshot') {
         sendResponse(await buildSnapshot());
+        return;
+      }
+      if (msg?.type === 'miyo-sync-set') {
+        if (msg.enabled === true) await enableMiyoSync();
+        else await disableMiyoSync();
+        sendResponse({ ok: true });
         return;
       }
       sendResponse({ error: 'unknown_message' });

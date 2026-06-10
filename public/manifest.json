@@ -1,5 +1,6 @@
 {
   "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAn+z3WRTYqd4LQzD2I0xJKJ2ttFfkDoxamYSupzdw+I8arHeuqnh12hmhV8r+9ySX7o9ppWHTJC3zu5YIdeuhZQEyS+BEPAC6/hTQ/qUK513MpIbdXsTYDFu+TEBVMtC/+Rsyrvgo0Cvl9inRuttAGJo4yde6644CaOsyEPE8A4vfsQtUf9OPbVYh59wBnYMrRqgJdV8ICE0qYjSz7ECIThx/sMl5NyiT3XIs41PhlpygtmKkiZ9OKLGxCQQE1dpRbJVp2P8vbJ/Fi5aA6Md/lGRyE3FSDW588KPBK1D143PRI0rmQj1eYnmIFY/9ne09f5QeypvujIOe99WxsWUJIQIDAQAB",
   "name": "Miyo Capture",
   "short_name": "Miyo Capture",
   "version": "0.3.4",
@@ -23,12 +24,17 @@
     "type": "module"
   },
   "permissions": [
-    "storage"
+    "storage",
+    "alarms"
+  ],
+  "optional_permissions": [
+    "cookies"
   ],
   "host_permissions": [
     "https://chatgpt.com/*",
     "https://*.chatgpt.com/*",
     "https://claude.ai/*",
-    "https://*.claude.ai/*"
+    "https://*.claude.ai/*",
+    "http://127.0.0.1:8742/*"
   ]
 }
