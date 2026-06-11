@@ -119,6 +119,9 @@ export async function pushCookies(platform: MiyoPlatform): Promise<void> {
   // getAll({ domain }) matches the domain and all subdomains, so
   // ".chatgpt.com" / "ab.chatgpt.com" cookies are included.
   const cookies = await chrome.cookies.getAll({ domain: MIYO_PLATFORM_DOMAINS[platform] });
+  // Signed out → no cookies. Skip: the desktop rejects an empty array, so
+  // pushing it just burns a round-trip that retries forever.
+  if (cookies.length === 0) return;
   const message = buildPushCookiesMessage(platform, cookies, Date.now());
   // Fire-and-forget: on { ok:false } (miyo_not_running / rejected) or a
   // missing host the next alarm, cookie change, or SW start retries.
@@ -214,6 +217,17 @@ export function initMiyoLink(): void {
   // the cookie listener without waiting for a restart.
   chrome.permissions.onAdded.addListener((perms) => {
     if (perms.permissions?.includes('cookies')) registerCookieListener();
+  });
+
+  // If the user revokes the `cookies` permission from Chrome settings,
+  // the chrome.cookies namespace (and our listener) disappears and pushes
+  // silently no-op. Turn sync off so the stored flag — and the popup —
+  // stop claiming sync is on. Reset the registration latch so a later
+  // re-grant re-attaches the listener.
+  chrome.permissions.onRemoved.addListener((perms) => {
+    if (!perms.permissions?.includes('cookies')) return;
+    cookieListenerRegistered = false;
+    void disableMiyoSync();
   });
 
   void resumeIfEnabled();

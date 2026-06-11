@@ -458,7 +458,7 @@ function onMiyoToggle(checked: boolean): void {
       await chrome.runtime.sendMessage({ type: 'miyo-sync-set', enabled: false });
       ui.miyo.enabled = false;
       render();
-    })();
+    })().catch(() => render()); // on failure keep the toggle showing its real state
   }
 }
 
