@@ -386,13 +386,25 @@ function renderMiyoStatusRow(platform: MiyoPlatform): string {
   const p = ui.miyo.status?.platforms[platform] ?? null;
   const signedOut = findSite(platform)?.session?.signedIn === false;
 
-  const pillCls = p ? syncStatePill(p.state) : 'status-off';
-  const pillText = p ? syncStateCopy(p) : 'Checking…';
-  const sub = p?.email
-    ? `<div class="miyo-row-sub">${escape(p.email)}</div>`
-    : signedOut
-      ? `<div class="miyo-row-sub miyo-row-warn">Not signed in</div>`
-      : '';
+  // When the user is signed out of the site, the desktop's failure
+  // states (sync error, session expired, not connected) are downstream
+  // symptoms — name the real problem instead. States where sync still
+  // works (synced/syncing/paused) take precedence over a stale
+  // signed-out probe. The account email the desktop reports in its
+  // status payload is sensitive and never rendered.
+  const syncOk =
+    p?.state === 'synced' || p?.state === 'syncing' || p?.state === 'paused';
+  const showSignedOut = signedOut && !syncOk;
+  const pillCls = showSignedOut
+    ? 'status-warn'
+    : p
+      ? syncStatePill(p.state)
+      : 'status-off';
+  const pillText = showSignedOut
+    ? 'Not signed in'
+    : p
+      ? syncStateCopy(p)
+      : 'Checking…';
 
   return `
     <div class="site-card miyo-row" style="--svc-color:${brand.color};--svc-color-soft:${brand.soft};">
@@ -400,7 +412,6 @@ function renderMiyoStatusRow(platform: MiyoPlatform): string {
         <div class="site-logo">${escape(brand.initial)}</div>
         <div class="site-title">
           <div class="site-name">${escape(label)}</div>
-          ${sub}
         </div>
         <span class="status-pill site-status ${pillCls}">${escape(pillText)}</span>
       </div>
