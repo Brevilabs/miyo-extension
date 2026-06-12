@@ -136,6 +136,158 @@ main {
   line-height: 1.5;
 }
 
+/* ---------- Miyo Desktop sync ---------- */
+
+.miyo-card {
+  margin-bottom: 12px;
+  padding: 10px 14px;
+  background: var(--paper);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.miyo-toggle-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.miyo-toggle-row:has(input:disabled) {
+  cursor: default;
+}
+
+.miyo-toggle-label {
+  flex: 1;
+  font-family: 'Fraunces', serif;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--ink);
+  letter-spacing: -0.005em;
+}
+
+.miyo-hint {
+  font-family: 'Fraunces', serif;
+  font-style: italic;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.miyo-get-link {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--teal-strong);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.miyo-get-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* Switch: a checkbox restyled as a small sliding track. */
+
+.miyo-switch {
+  position: relative;
+  display: inline-block;
+  width: 34px;
+  height: 20px;
+  flex-shrink: 0;
+}
+
+.miyo-switch input {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  opacity: 0;
+  cursor: inherit;
+}
+
+.miyo-switch-track {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: var(--border);
+  transition: background 0.15s ease;
+  pointer-events: none;
+}
+
+.miyo-switch-track::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--paper);
+  box-shadow: 0 1px 3px rgba(20, 30, 40, 0.25);
+  transition: transform 0.15s ease;
+}
+
+.miyo-switch input:checked + .miyo-switch-track {
+  background: var(--teal);
+}
+
+.miyo-switch input:checked + .miyo-switch-track::after {
+  transform: translateX(14px);
+}
+
+.miyo-switch input:disabled + .miyo-switch-track {
+  opacity: 0.55;
+}
+
+.miyo-switch input:focus-visible + .miyo-switch-track {
+  box-shadow: 0 0 0 2px var(--teal-soft);
+}
+
+/* Status view (toggle on + Miyo reachable) */
+
+.miyo-row .site-logo {
+  width: 30px;
+  height: 30px;
+  font-size: 15px;
+}
+
+/* Sync-state copy is sentence-length ("Session expired — open the
+   site to refresh"), so the pill drops the uppercase treatment and is
+   allowed to wrap. */
+.miyo-row .status-pill {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: normal;
+  text-align: left;
+  max-width: 55%;
+  line-height: 1.35;
+}
+
+.miyo-row-sub {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 2px;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.miyo-row-warn {
+  color: #b45309;
+}
+
+.miyo-sync-note {
+  margin-top: 10px;
+  font-family: 'Fraunces', serif;
+  font-style: italic;
+  font-size: 11px;
+  color: var(--muted);
+  text-align: center;
+}
+
 /* ---------- Site cards ---------- */
 
 .site-list {

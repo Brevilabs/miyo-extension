@@ -21,5 +21,5 @@ MV3 Chrome extension, zero runtime dependencies. Two esbuild entry points: `src/
 
 ## Hard constraints (not enforced by code)
 
-- **No background timers.** No `chrome.alarms`, no intervals. Every fetch must be a direct consequence of the user clicking Sync now — this user-initiated posture is load-bearing for how the project is framed.
-- **No runtime dependencies, no telemetry.** The extension has zero deps and ships no analytics/feedback pings. Local-only is the product.
+- **No background timers in capture mode.** The capture flow has no `chrome.alarms`, no intervals — every site fetch is a direct consequence of the user clicking Download. One deliberate exception: the opt-in "Sync to Miyo Desktop" mode (`src/miyo-link.ts`) uses a single `miyo-sync-push` alarm to re-push session cookies to the local Miyo app over Chrome native messaging; it never fetches chat content from the sites in the background. Don't add others.
+- **No runtime dependencies, no telemetry.** The extension has zero deps and ships no analytics/feedback pings. Local-only is the product (Miyo sync sends cookies only to the desktop app's native-messaging host — no network, no remote endpoint).
