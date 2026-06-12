@@ -46,11 +46,41 @@ your editor, or `grep`. Nothing locks you in.
 More sources are planned. Each is a single adapter file — see
 [docs/ADAPTER-API.md](docs/ADAPTER-API.md).
 
+## Sync to Miyo Desktop (optional)
+
+If you run [Miyo Desktop](https://www.miyo.md/), flip **Sync to Miyo
+Desktop** at the top of the popup instead of downloading ZIPs by hand.
+In this mode the extension hands your ChatGPT and Claude session to the
+desktop app, which then syncs your conversation history in the
+background **on your own machine** — new chats land in Miyo without you
+clicking Download.
+
+- **Opt-in, off by default.** Nothing is shared until you turn the
+  toggle on; turning it off stops it.
+- **Cookies cross the wire here, not chats.** The extension sends only
+  the session cookies for `chatgpt.com` / `claude.ai` so the desktop can
+  fetch on your behalf — the conversation data itself flows desktop-side,
+  never through the extension.
+- **Local transport, no loopback port.** Delivery is over Chrome
+  [native messaging](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging)
+  to Miyo Desktop's host (`md.miyo.chatsync`), which accepts the handoff
+  only over a local socket and is pinned to this extension's ID (see
+  [docs/EXTENSION-KEY.md](docs/EXTENSION-KEY.md)). It fails closed when
+  Miyo isn't running.
+- **Requires Miyo Desktop.** Without it the toggle just links you to
+  [miyo.md](https://www.miyo.md/).
+
+Enabling this adds two permissions: `nativeMessaging` (to reach the
+desktop host) and the optional `cookies` permission, requested only the
+first time you turn the toggle on.
+
 ## Design
 
-- **Sync only when you click.** No background polling, no alarms,
-  no service-worker timers. Every fetch is a direct consequence of
-  you pressing Download.
+- **Capture runs only when you click.** In the default download mode
+  there's no background polling, no alarms, no service-worker timers —
+  every fetch is a direct consequence of you pressing Download. The
+  optional *Sync to Miyo Desktop* mode above is the one exception, and
+  only while you have it switched on.
 - **Local only.** Conversation data goes straight to your Downloads
   folder. It never leaves your machine.
 - **Zero runtime dependencies, zero telemetry.** The extension
