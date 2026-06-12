@@ -11,6 +11,10 @@ npm run package            # build + zip for Chrome Web Store
 
 Single test: `tsc -p tsconfig.test.json && node --test .test-dist/framework/chat.test.js`.
 
+## Releasing
+
+`npm version patch` (syncs manifest via `scripts/sync-version.mjs`), commit `Release vX.Y.Z`, tag `vX.Y.Z`, push with tags. Pushing the tag triggers `.github/workflows/release.yml`, which builds the zip and creates the GitHub release — do NOT `gh release create` manually, it makes the workflow fail with a tag conflict. Always check the Release workflow run is green (`gh run list`) before claiming the release succeeded.
+
 ## Architecture
 
 MV3 Chrome extension, zero runtime dependencies. Two esbuild entry points: `src/background/index.ts` (service worker) and `src/popup/index.ts`.
