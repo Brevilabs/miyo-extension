@@ -27,6 +27,7 @@ import { buildZip } from '../framework/zip.js';
 import { fetchMiyoStatus, probeMiyo, MIYO_SYNC_ENABLED_KEY } from '../miyo-link.js';
 import {
   MIYO_PLATFORMS,
+  summarizePlatform,
   syncStateCopy,
   syncStatePill,
   type MiyoChatsStatus,
@@ -383,27 +384,32 @@ const MIYO_PLATFORM_LABELS: Record<MiyoPlatform, string> = {
 function renderMiyoStatusRow(platform: MiyoPlatform): string {
   const label = MIYO_PLATFORM_LABELS[platform];
   const brand = brandFor(platform, label);
-  const p = ui.miyo.status?.platforms[platform] ?? null;
+  // The desktop reports a v2 multi-account status per platform; collapse it to
+  // one summary for this single pill. null = no accounts yet → "Checking…".
+  const platformStatus = ui.miyo.status?.platforms[platform] ?? null;
+  const summary = platformStatus ? summarizePlatform(platformStatus) : null;
   const signedOut = findSite(platform)?.session?.signedIn === false;
 
   // When the user is signed out of the site, the desktop's failure
   // states (sync error, session expired, not connected) are downstream
   // symptoms — name the real problem instead. States where sync still
-  // works (synced/syncing/paused) take precedence over a stale
+  // works (synced/syncing/connecting) take precedence over a stale
   // signed-out probe. The account email the desktop reports in its
   // status payload is sensitive and never rendered.
   const syncOk =
-    p?.state === 'synced' || p?.state === 'syncing' || p?.state === 'paused';
+    summary?.state === 'synced' ||
+    summary?.state === 'syncing' ||
+    summary?.state === 'connecting';
   const showSignedOut = signedOut && !syncOk;
   const pillCls = showSignedOut
     ? 'status-warn'
-    : p
-      ? syncStatePill(p.state)
+    : summary
+      ? syncStatePill(summary.state)
       : 'status-off';
   const pillText = showSignedOut
     ? 'Not signed in'
-    : p
-      ? syncStateCopy(p)
+    : summary
+      ? syncStateCopy(summary)
       : 'Checking…';
 
   return `
