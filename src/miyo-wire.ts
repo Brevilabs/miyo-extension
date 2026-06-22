@@ -109,24 +109,37 @@ export function platformForCookieDomain(domain: string): MiyoPlatform | null {
   return null;
 }
 
-// `status` payload the host returns for a { type: 'status' } message.
+// `status` payload the host returns for a { type: 'status' } message. Mirrors
+// the desktop service's v2 multi-account shape (service-node manager.ts
+// `ChatSyncStatus`): each platform carries an `accounts` array rather than a
+// single flat status. The popup shows one pill per platform, so it collapses
+// the array with summarizePlatform() below.
 export type MiyoSyncState =
   | 'not_connected'
+  | 'connecting'
   | 'waiting_for_browser'
-  | 'paused'
   | 'syncing'
   | 'synced'
   | 'error';
 
-export interface MiyoPlatformStatus {
-  label: string;
-  state: MiyoSyncState;
+export interface MiyoAccountStatus {
+  slot_id: string;
+  account_id: string | null;
   email: string | null;
+  label: string | null;
+  connected: boolean;
+  state: MiyoSyncState;
   conversation_count: number;
   last_sync_at: number | null; // ms epoch
   syncing: { completed: number; total: number | null } | null;
-  connected: boolean;
-  folder_name: string;
+}
+
+export interface MiyoPlatformStatus {
+  platform: MiyoPlatform;
+  label: string;
+  folder_path: string | null;
+  folder_name: string | null;
+  accounts: MiyoAccountStatus[];
 }
 
 export interface MiyoChatsStatus {
@@ -136,39 +149,94 @@ export interface MiyoChatsStatus {
   platforms: Partial<Record<MiyoPlatform, MiyoPlatformStatus>>;
 }
 
-// Human copy for one platform's sync state, shown in the popup's
+// A platform's accounts collapsed into the single state + counts the popup's
+// one status pill renders.
+export interface MiyoPlatformSummary {
+  state: MiyoSyncState;
+  conversationCount: number;
+  syncing: { completed: number; total: number | null } | null;
+}
+
+// State precedence when a platform has several accounts: an actively-working
+// or failing account should win over a quietly-synced one, so the single pill
+// surfaces whatever most needs the user's attention. Lower index = higher
+// priority.
+const STATE_PRIORITY: MiyoSyncState[] = [
+  'syncing',
+  'connecting',
+  'error',
+  'waiting_for_browser',
+  'synced',
+  'not_connected',
+];
+
+function combineSyncing(
+  a: { completed: number; total: number | null } | null,
+  b: { completed: number; total: number | null } | null
+): { completed: number; total: number | null } | null {
+  if (!a) return b;
+  if (!b) return a;
+  // A null total means "unknown size"; one unknown makes the sum unknown.
+  return {
+    completed: a.completed + b.completed,
+    total: a.total === null || b.total === null ? null : a.total + b.total,
+  };
+}
+
+// Collapse a platform's accounts into one summary for the popup's single
+// status pill. Returns null when there are no accounts yet — the popup keeps
+// showing "Checking…" until the first account appears. Conversation counts sum
+// across accounts; progress sums across whichever accounts are syncing.
+export function summarizePlatform(p: MiyoPlatformStatus): MiyoPlatformSummary | null {
+  if (p.accounts.length === 0) return null;
+  let state: MiyoSyncState = 'not_connected';
+  let rank = STATE_PRIORITY.length;
+  let conversationCount = 0;
+  let syncing: { completed: number; total: number | null } | null = null;
+  for (const a of p.accounts) {
+    conversationCount += a.conversation_count;
+    const r = STATE_PRIORITY.indexOf(a.state);
+    if (r !== -1 && r < rank) {
+      rank = r;
+      state = a.state;
+    }
+    if (a.state === 'syncing') syncing = combineSyncing(syncing, a.syncing);
+  }
+  return { state, conversationCount, syncing };
+}
+
+// Human copy for a platform's collapsed sync state, shown in the popup's
 // status view.
-export function syncStateCopy(p: MiyoPlatformStatus): string {
-  switch (p.state) {
+export function syncStateCopy(s: MiyoPlatformSummary): string {
+  switch (s.state) {
     case 'synced': {
-      const n = p.conversation_count;
+      const n = s.conversationCount;
       return `Synced · ${n} conversation${n === 1 ? '' : 's'}`;
     }
     case 'syncing':
-      return p.syncing && p.syncing.total !== null
-        ? `Syncing… ${p.syncing.completed} of ${p.syncing.total}`
+      return s.syncing && s.syncing.total !== null
+        ? `Syncing… ${s.syncing.completed} of ${s.syncing.total}`
         : 'Syncing…';
+    case 'connecting':
+      return 'Connecting…';
     case 'waiting_for_browser':
       return 'Session expired — open the site to refresh';
     case 'not_connected':
       return 'Waiting for first sync';
-    case 'paused':
-      return 'Paused';
     case 'error':
       return 'Sync error';
   }
 }
 
-// Status-pill tone for one platform's sync state. Maps onto the
+// Status-pill tone for a platform's collapsed sync state. Maps onto the
 // existing popup.css `.status-*` pill classes.
 export function syncStatePill(state: MiyoSyncState): string {
   switch (state) {
     case 'synced':
       return 'status-ready';
     case 'syncing':
+    case 'connecting':
       return 'status-syncing';
-    case 'paused':
-      return 'status-paused';
     case 'not_connected':
       return 'status-off';
     case 'waiting_for_browser':
