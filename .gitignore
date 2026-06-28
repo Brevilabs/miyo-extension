@@ -2,6 +2,7 @@ node_modules/
 dist/
 .test-dist/
 *.zip
+miyo-capture-*-chrome/
 .DS_Store
 *.log
 .env

@@ -2,15 +2,21 @@
 
 # Miyo Capture
 
-> Capture your AI chats as markdown. Yours, on your machine.
+> Auto-sync your AI chats to local markdown files. Yours, on your machine.
 
 A browser extension that turns your **ChatGPT** and **Claude**
-conversations into markdown files. No accounts, no servers in the
-cloud, no telemetry.
+conversations into markdown files you own. No accounts, no cloud, no
+telemetry.
 
-Pick a time range, click **Download**, and the extension fetches the
-matching conversations and hands you a single ZIP of markdown files —
-one conversation per file — straight to your Downloads folder.
+Most exporters make you click Download every time. Miyo Capture does
+that too — but with the free [Miyo Desktop](https://www.miyo.md/) app it
+also **keeps your chats syncing automatically** to plain files on your
+machine, hands-off, as you keep chatting. No re-exporting, no
+remembering to back up.
+
+Prefer zero setup? Pick a time range, click **Download**, and the
+extension hands you a single ZIP of markdown files — one conversation
+per file — straight to your Downloads folder.
 
 The output is plain markdown — open it in **Obsidian**, **Logseq**,
 your editor, or `grep`. Nothing locks you in.
