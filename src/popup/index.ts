@@ -58,6 +58,11 @@ interface UIState {
   } | null;
   capturePort: chrome.runtime.Port | null;
   banner: { kind: 'info' | 'error'; text: string } | null;
+  // Whether the manifest's host_permissions are granted; null while
+  // the check is in flight. Chrome grants them at install so this is
+  // effectively always true there; Firefox MV3 treats them as opt-in,
+  // so on first run the site list is replaced with a grant card.
+  hostAccess: boolean | null;
   ranges: Record<SiteId, TimeRange>;
   // Guards exportPendingAsZip against double-trigger (done broadcast
   // + open-time auto-zip both arriving).
@@ -77,6 +82,7 @@ const ui: UIState = {
   captureProgress: null,
   capturePort: null,
   banner: null,
+  hostAccess: null,
   ranges: {},
   zipping: false,
   miyo: { running: null, enabled: false, status: null },
@@ -195,6 +201,40 @@ function findSite(siteId: SiteId): SiteRow | null {
 }
 
 // ──────────────────────────────────────────────────────────────────
+// Host access
+// ──────────────────────────────────────────────────────────────────
+
+function hostOrigins(): string[] {
+  return chrome.runtime.getManifest().host_permissions ?? [];
+}
+
+async function checkHostAccess(): Promise<void> {
+  try {
+    ui.hostAccess = await chrome.permissions.contains({ origins: hostOrigins() });
+  } catch {
+    // Treat a failed check as granted — the grant card would
+    // otherwise dead-end the popup.
+    ui.hostAccess = true;
+  }
+  render();
+}
+
+// Must be called synchronously inside the user gesture, before any
+// await, or Firefox rejects the request.
+function onGrantHosts(): void {
+  void chrome.permissions
+    .request({ origins: hostOrigins() })
+    .then((granted) => {
+      if (!granted) return;
+      ui.hostAccess = true;
+      render();
+      // Re-probe sessions now that the site fetches can succeed.
+      void refresh();
+    })
+    .catch(() => render());
+}
+
+// ──────────────────────────────────────────────────────────────────
 // Rendering
 // ──────────────────────────────────────────────────────────────────
 
@@ -224,6 +264,21 @@ function renderProgress(): string {
     ? `<div class="progress-bar-container"><div class="progress-bar" style="width:${Math.min(100, Math.round((completed / total!) * 100))}%"></div></div>`
     : `<div class="progress-bar-container"><div class="progress-bar progress-bar-indeterminate"></div></div>`;
   return `<div class="site-progress">${bar}<span class="site-progress-text">${escape(text)}</span></div>`;
+}
+
+function renderHostAccessCard(): string {
+  const hosts = [
+    ...new Set(
+      hostOrigins().map((o) => o.replace(/^https?:\/\/(\*\.)?/, '').replace(/\/\*$/, ''))
+    ),
+  ].join(', ');
+  return `
+    <div class="site-card">
+      <div class="site-hint">Firefox needs your permission before Miyo Capture can read your chats on ${escape(hosts)}. Nothing is fetched until you run a capture.</div>
+      <div class="site-actions">
+        <button class="primary-button" data-action="grant-hosts">Allow access</button>
+      </div>
+    </div>`;
 }
 
 function renderSiteRow(s: SiteRow): string {
@@ -456,13 +511,17 @@ function startMiyoStatusPolling(): void {
 // must run synchronously inside the user gesture, before any await.
 function onMiyoToggle(checked: boolean): void {
   if (checked) {
+    // Host origins ride along for Firefox, where they start ungranted
+    // and cookies.getAll returns nothing without them. In Chrome
+    // they're granted at install, so this prompts for cookies only.
     void chrome.permissions
-      .request({ permissions: ['cookies'] })
+      .request({ permissions: ['cookies'], origins: hostOrigins() })
       .then(async (granted) => {
         if (!granted) {
           render(); // revert the visual toggle
           return;
         }
+        ui.hostAccess = true; // the grant covered host origins too
         await chrome.runtime.sendMessage({ type: 'miyo-sync-set', enabled: true });
         ui.miyo.enabled = true;
         render();
@@ -513,7 +572,9 @@ function render(): void {
   const syncView = ui.miyo.enabled && ui.miyo.running === true;
   const body = syncView
     ? renderMiyoStatusView()
-    : `<div class="site-list">${sites.map(renderSiteRow).join('')}</div>`;
+    : ui.hostAccess === false
+      ? renderHostAccessCard()
+      : `<div class="site-list">${sites.map(renderSiteRow).join('')}</div>`;
 
   root.innerHTML = `
     ${renderHeader()}
@@ -539,6 +600,7 @@ function render(): void {
       else if (action === 'resume') void onResume();
       else if (action === 'discard') void onDiscard();
       else if (action === 'open-site' && site) onOpenSite(site);
+      else if (action === 'grant-hosts') onGrantHosts();
     });
   });
 
@@ -827,6 +889,7 @@ async function init(): Promise<void> {
   render();
 
   void initMiyo();
+  void checkHostAccess();
 
   const [cached, ranges] = await Promise.all([loadCachedSnapshot(), loadRanges()]);
   ui.ranges = ranges;

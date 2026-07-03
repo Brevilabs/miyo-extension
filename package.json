@@ -7,11 +7,14 @@
   "type": "module",
   "scripts": {
     "build": "node scripts/build.mjs",
+    "build:firefox": "node scripts/build.mjs --target=firefox",
     "build:watch": "node scripts/build.mjs --watch",
     "typecheck": "tsc --noEmit",
     "test:unit": "node -e \"require('fs').rmSync('.test-dist',{recursive:true,force:true})\" && tsc -p tsconfig.test.json && node --test \".test-dist/**/*.test.js\"",
     "lint": "eslint src --ext .ts",
-    "package": "npm run build && node scripts/package.mjs",
+    "package": "npm run package:chrome && npm run package:firefox",
+    "package:chrome": "npm run build && node scripts/package.mjs",
+    "package:firefox": "npm run build:firefox && node scripts/package.mjs --target=firefox",
     "version": "node scripts/sync-version.mjs"
   },
   "devDependencies": {
