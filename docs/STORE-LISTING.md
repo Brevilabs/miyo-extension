@@ -8,7 +8,7 @@ Privacy policy URL: <https://www.miyo.md/extension/privacy>
 ## Short summary (≤132 chars — manifest `description` / store "Summary")
 
 ```
-Auto-sync your ChatGPT and Claude chats to local markdown files. Yours on your machine, never the cloud.
+Auto-sync your ChatGPT and Claude chats to local markdown with the free Miyo Desktop app. Yours, never the cloud.
 ```
 
 ## Detailed description (store listing body)
@@ -54,12 +54,20 @@ Privacy policy: https://www.miyo.md/extension/privacy
 - **Category:** Productivity
 - **Language:** English
 
+## Testing instructions (for reviewers — 500 char limit)
+
+```
+The extension needs no login; we provided a ChatGPT test account for the download flow.
+
+To test the optional auto-sync: install the free Miyo Desktop app (https://www.miyo.md) and run it, then enable "Sync to Miyo Desktop" in the popup and accept the optional cookies prompt. The extension hands your ChatGPT/Claude session to the local app via native messaging, which then saves your chats to a local folder automatically. Without the app running, the handoff fails closed and nothing is sent.
+```
+
 ## Privacy practices tab (dashboard)
 
 **Single purpose:**
 
 ```
-Capture the user's own ChatGPT and Claude conversation history and export it as a ZIP of markdown files saved locally.
+Capture the user's own ChatGPT and Claude conversation history and save it locally as markdown. The extension can download it as a ZIP, or the optional Miyo Desktop app can sync it into a folder on the computer. Either way the goal is the same: get the user's chats out as local files. Nothing is sent to any remote server.
 ```
 
 **Permission justifications:**
