@@ -140,6 +140,10 @@ export interface MiyoPlatformStatus {
   folder_path: string | null;
   folder_name: string | null;
   accounts: MiyoAccountStatus[];
+  // The desktop replayed the cookies we last pushed for this platform and the
+  // site rejected them outright, so that jar carries no session. Optional
+  // because an older desktop never sends it; absent reads the same as false.
+  cookies_rejected?: boolean;
 }
 
 export interface MiyoChatsStatus {
@@ -205,6 +209,27 @@ export function summarizePlatform(p: MiyoPlatformStatus): MiyoPlatformSummary | 
   return { state, conversationCount, syncing };
 }
 
+// Whether the popup should drop the desktop's per-account copy and say the
+// browser holds no session for this platform.
+//
+// Two independent signals say so: our own probe of the site, and the desktop
+// replaying the cookies we pushed and being turned away. The second catches
+// what the first misses — a jar that still looks signed in here but no longer
+// works — and both leave the user the same single thing to do, so they share
+// one message. States where sync is plainly working win over either, since a
+// probe can be stale.
+export function showsSignedOut(
+  platform: MiyoPlatformStatus | null,
+  summary: MiyoPlatformSummary | null,
+  probedSignedOut: boolean
+): boolean {
+  const syncOk =
+    summary?.state === 'synced' ||
+    summary?.state === 'syncing' ||
+    summary?.state === 'connecting';
+  return (probedSignedOut || platform?.cookies_rejected === true) && !syncOk;
+}
+
 // Human copy for a platform's collapsed sync state, shown in the popup's
 // status view.
 export function syncStateCopy(s: MiyoPlatformSummary): string {
@@ -220,7 +245,10 @@ export function syncStateCopy(s: MiyoPlatformSummary): string {
     case 'connecting':
       return 'Connecting…';
     case 'waiting_for_browser':
-      return 'Session expired — open the site to refresh';
+      // Not "open the site to refresh": this extension only ever reads the
+      // cookies of the Chrome profile it is installed in, so a user signed in
+      // on another profile can open the site all day without anything changing.
+      return 'Session expired — sign in again in this browser';
     case 'not_connected':
       return 'Waiting for first sync';
     case 'error':

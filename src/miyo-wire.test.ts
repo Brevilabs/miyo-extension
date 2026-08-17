@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   buildPushCookiesMessage,
   platformForCookieDomain,
+  showsSignedOut,
   summarizePlatform,
   syncStateCopy,
   syncStatePill,
@@ -109,7 +110,7 @@ test('maps sync states to popup copy', () => {
   assert.equal(syncStateCopy(summary({ state: 'connecting' })), 'Connecting…');
   assert.equal(
     syncStateCopy(summary({ state: 'waiting_for_browser' })),
-    'Session expired — open the site to refresh'
+    'Session expired — sign in again in this browser'
   );
   assert.equal(syncStateCopy(summary({ state: 'not_connected' })), 'Waiting for first sync');
   assert.equal(syncStateCopy(summary({ state: 'error' })), 'Sync error');
@@ -214,4 +215,31 @@ test('surfaces an erroring account over a synced one', () => {
   );
   assert.equal(s?.state, 'error');
   assert.equal(s?.conversationCount, 9);
+});
+
+// ---------------------------------------------------------------------------
+// showsSignedOut — is this browser's session the real problem?
+// ---------------------------------------------------------------------------
+
+const rejected = (): MiyoPlatformStatus => ({ ...platform([]), cookies_rejected: true });
+
+test('a desktop cookie rejection reads as signed out even when our own probe says otherwise', () => {
+  // The case that sent users chasing "session expired": the jar still looks
+  // signed in to the extension, but the desktop replayed it and was refused.
+  assert.equal(showsSignedOut(rejected(), summary({ state: 'waiting_for_browser' }), false), true);
+});
+
+test('our own signed-out probe still stands on its own', () => {
+  assert.equal(showsSignedOut(platform([]), summary({ state: 'waiting_for_browser' }), true), true);
+});
+
+test('a working sync outranks both signals, so a stale probe cannot cry wolf', () => {
+  assert.equal(showsSignedOut(rejected(), summary({ state: 'syncing' }), true), false);
+  assert.equal(showsSignedOut(rejected(), summary({ state: 'synced' }), true), false);
+  assert.equal(showsSignedOut(rejected(), summary({ state: 'connecting' }), true), false);
+});
+
+test('an older desktop omits cookies_rejected, which must read as "no news"', () => {
+  assert.equal(showsSignedOut(platform([]), summary({ state: 'waiting_for_browser' }), false), false);
+  assert.equal(showsSignedOut(null, null, false), false);
 });
