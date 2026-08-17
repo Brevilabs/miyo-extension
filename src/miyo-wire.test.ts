@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   buildPushCookiesMessage,
+  browserProblem,
+  browserProblemCopy,
   platformForCookieDomain,
   summarizePlatform,
   syncStateCopy,
@@ -109,7 +111,7 @@ test('maps sync states to popup copy', () => {
   assert.equal(syncStateCopy(summary({ state: 'connecting' })), 'Connecting…');
   assert.equal(
     syncStateCopy(summary({ state: 'waiting_for_browser' })),
-    'Session expired — open the site to refresh'
+    'Session expired — sign in again in this browser'
   );
   assert.equal(syncStateCopy(summary({ state: 'not_connected' })), 'Waiting for first sync');
   assert.equal(syncStateCopy(summary({ state: 'error' })), 'Sync error');
@@ -214,4 +216,39 @@ test('surfaces an erroring account over a synced one', () => {
   );
   assert.equal(s?.state, 'error');
   assert.equal(s?.conversationCount, 9);
+});
+
+// ---------------------------------------------------------------------------
+// browserProblem — is this browser the reason sync is stuck, and which way?
+// ---------------------------------------------------------------------------
+
+const rejected = (): MiyoPlatformStatus => ({ ...platform([]), cookies_rejected: true });
+
+test('a signed-in browser whose cookies the desktop cannot use is never called signed out', () => {
+  // The reported case: the user is signed in to Claude in this very profile,
+  // our own probe agrees, and the desktop still gets a 403 replaying the jar.
+  // "Not signed in" would be a lie, and the one thing it asks for is already done.
+  const p = browserProblem(rejected(), summary({ state: 'waiting_for_browser' }), false);
+  assert.equal(p, 'unusable');
+  assert.equal(
+    browserProblemCopy(p!, 'Claude'),
+    "Signed in, but Miyo can't use this Claude session"
+  );
+});
+
+test('our own signed-out probe wins, since that is the one the user can act on', () => {
+  const p = browserProblem(rejected(), summary({ state: 'waiting_for_browser' }), true);
+  assert.equal(p, 'signed_out');
+  assert.equal(browserProblemCopy(p!, 'Claude'), 'Not signed in to Claude in this browser');
+});
+
+test('a working sync outranks both signals, so a stale probe cannot cry wolf', () => {
+  assert.equal(browserProblem(rejected(), summary({ state: 'syncing' }), true), null);
+  assert.equal(browserProblem(rejected(), summary({ state: 'synced' }), true), null);
+  assert.equal(browserProblem(rejected(), summary({ state: 'connecting' }), true), null);
+});
+
+test('an older desktop omits cookies_rejected, which must read as "no news"', () => {
+  assert.equal(browserProblem(platform([]), summary({ state: 'waiting_for_browser' }), false), null);
+  assert.equal(browserProblem(null, null, false), null);
 });

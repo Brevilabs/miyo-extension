@@ -140,6 +140,10 @@ export interface MiyoPlatformStatus {
   folder_path: string | null;
   folder_name: string | null;
   accounts: MiyoAccountStatus[];
+  // The desktop replayed the cookies we last pushed for this platform and the
+  // site rejected them outright, so that jar carries no session. Optional
+  // because an older desktop never sends it; absent reads the same as false.
+  cookies_rejected?: boolean;
 }
 
 export interface MiyoChatsStatus {
@@ -205,6 +209,41 @@ export function summarizePlatform(p: MiyoPlatformStatus): MiyoPlatformSummary | 
   return { state, conversationCount, syncing };
 }
 
+// Why this browser can't feed the desktop, when that is a better answer than
+// the desktop's own per-account state:
+//   • 'signed_out' — we asked the site ourselves and it says nobody is signed
+//     in here. The user has something to do about it.
+//   • 'unusable'  — the site answers us fine, but the desktop replayed the
+//     cookies we handed it and was turned away. Telling this user to sign in
+//     would be wrong; they already are. Naming the split honestly is the point.
+// null means say nothing special and let the desktop's copy stand.
+//
+// A platform that is plainly syncing outranks both, since our probe can be
+// stale while sync carries on happily.
+export type MiyoBrowserProblem = 'signed_out' | 'unusable';
+
+export function browserProblem(
+  platform: MiyoPlatformStatus | null,
+  summary: MiyoPlatformSummary | null,
+  probedSignedOut: boolean
+): MiyoBrowserProblem | null {
+  const syncOk =
+    summary?.state === 'synced' ||
+    summary?.state === 'syncing' ||
+    summary?.state === 'connecting';
+  if (syncOk) return null;
+  if (probedSignedOut) return 'signed_out';
+  return platform?.cookies_rejected === true ? 'unusable' : null;
+}
+
+// Copy for each problem. Both name this browser, because the extension is the
+// only part of Miyo that knows which profile the cookies came from.
+export function browserProblemCopy(problem: MiyoBrowserProblem, label: string): string {
+  return problem === 'signed_out'
+    ? `Not signed in to ${label} in this browser`
+    : `Signed in, but Miyo can't use this ${label} session`;
+}
+
 // Human copy for a platform's collapsed sync state, shown in the popup's
 // status view.
 export function syncStateCopy(s: MiyoPlatformSummary): string {
@@ -220,7 +259,10 @@ export function syncStateCopy(s: MiyoPlatformSummary): string {
     case 'connecting':
       return 'Connecting…';
     case 'waiting_for_browser':
-      return 'Session expired — open the site to refresh';
+      // Not "open the site to refresh": this extension only ever reads the
+      // cookies of the Chrome profile it is installed in, so a user signed in
+      // on another profile can open the site all day without anything changing.
+      return 'Session expired — sign in again in this browser';
     case 'not_connected':
       return 'Waiting for first sync';
     case 'error':
