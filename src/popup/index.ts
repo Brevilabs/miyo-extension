@@ -26,8 +26,9 @@ import { clearPendingRun } from '../framework/run-state.js';
 import { buildZip } from '../framework/zip.js';
 import { fetchMiyoStatus, probeMiyo, MIYO_SYNC_ENABLED_KEY } from '../miyo-link.js';
 import {
+  browserProblem,
+  browserProblemCopy,
   MIYO_PLATFORMS,
-  showsSignedOut,
   summarizePlatform,
   syncStateCopy,
   syncStatePill,
@@ -390,24 +391,21 @@ function renderMiyoStatusRow(platform: MiyoPlatform): string {
   const platformStatus = ui.miyo.status?.platforms[platform] ?? null;
   const summary = platformStatus ? summarizePlatform(platformStatus) : null;
   // The desktop's failure states (sync error, session expired, not connected)
-  // are downstream symptoms of a signed-out browser, so name the real problem
-  // instead. The account email the desktop reports in its status payload is
-  // sensitive and never rendered.
-  const showSignedOut = showsSignedOut(
+  // are downstream symptoms when this browser is the thing that's wrong, so
+  // name that instead. The account email the desktop reports in its status
+  // payload is sensitive and never rendered.
+  const problem = browserProblem(
     platformStatus,
     summary,
     findSite(platform)?.session?.signedIn === false
   );
-  const pillCls = showSignedOut
+  const pillCls = problem
     ? 'status-warn'
     : summary
       ? syncStatePill(summary.state)
       : 'status-off';
-  // Name the browser: the extension is the only piece of Miyo that knows which
-  // Chrome profile these cookies came from, and signing in anywhere else is the
-  // mistake this copy exists to prevent.
-  const pillText = showSignedOut
-    ? `Not signed in to ${label} in this browser`
+  const pillText = problem
+    ? browserProblemCopy(problem, label)
     : summary
       ? syncStateCopy(summary)
       : 'Checking…';

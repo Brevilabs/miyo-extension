@@ -209,25 +209,39 @@ export function summarizePlatform(p: MiyoPlatformStatus): MiyoPlatformSummary | 
   return { state, conversationCount, syncing };
 }
 
-// Whether the popup should drop the desktop's per-account copy and say the
-// browser holds no session for this platform.
+// Why this browser can't feed the desktop, when that is a better answer than
+// the desktop's own per-account state:
+//   • 'signed_out' — we asked the site ourselves and it says nobody is signed
+//     in here. The user has something to do about it.
+//   • 'unusable'  — the site answers us fine, but the desktop replayed the
+//     cookies we handed it and was turned away. Telling this user to sign in
+//     would be wrong; they already are. Naming the split honestly is the point.
+// null means say nothing special and let the desktop's copy stand.
 //
-// Two independent signals say so: our own probe of the site, and the desktop
-// replaying the cookies we pushed and being turned away. The second catches
-// what the first misses — a jar that still looks signed in here but no longer
-// works — and both leave the user the same single thing to do, so they share
-// one message. States where sync is plainly working win over either, since a
-// probe can be stale.
-export function showsSignedOut(
+// A platform that is plainly syncing outranks both, since our probe can be
+// stale while sync carries on happily.
+export type MiyoBrowserProblem = 'signed_out' | 'unusable';
+
+export function browserProblem(
   platform: MiyoPlatformStatus | null,
   summary: MiyoPlatformSummary | null,
   probedSignedOut: boolean
-): boolean {
+): MiyoBrowserProblem | null {
   const syncOk =
     summary?.state === 'synced' ||
     summary?.state === 'syncing' ||
     summary?.state === 'connecting';
-  return (probedSignedOut || platform?.cookies_rejected === true) && !syncOk;
+  if (syncOk) return null;
+  if (probedSignedOut) return 'signed_out';
+  return platform?.cookies_rejected === true ? 'unusable' : null;
+}
+
+// Copy for each problem. Both name this browser, because the extension is the
+// only part of Miyo that knows which profile the cookies came from.
+export function browserProblemCopy(problem: MiyoBrowserProblem, label: string): string {
+  return problem === 'signed_out'
+    ? `Not signed in to ${label} in this browser`
+    : `Signed in, but Miyo can't use this ${label} session`;
 }
 
 // Human copy for a platform's collapsed sync state, shown in the popup's
