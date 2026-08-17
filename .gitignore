@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist-firefox/
 .test-dist/
 *.zip
 miyo-capture-*-chrome/

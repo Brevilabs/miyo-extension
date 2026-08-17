@@ -45,5 +45,6 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" \
             "miyo-capture-${GITHUB_REF_NAME#v}-chrome.zip" \
+            "miyo-capture-${GITHUB_REF_NAME#v}-firefox.zip" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes

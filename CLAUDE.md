@@ -2,22 +2,23 @@
 
 ```bash
 npm run build              # bundles src/ → dist/ (esbuild, ESM, chrome120 target)
+npm run build:firefox      # bundles src/ → dist-firefox/ (event-page background, gecko manifest keys)
 npm run build:watch        # rebuild on file change
 npm run typecheck          # tsc --noEmit, strict
 npm run lint               # eslint src --ext .ts
 npm run test:unit          # node:test runner
-npm run package            # build + zip for Chrome Web Store
+npm run package            # build + zip both targets (miyo-capture-<v>-{chrome,firefox}.zip)
 ```
 
 Single test: `tsc -p tsconfig.test.json && node --test .test-dist/framework/chat.test.js`.
 
 ## Releasing
 
-`npm version patch` (syncs manifest via `scripts/sync-version.mjs`), commit `Release vX.Y.Z`, tag `vX.Y.Z`, push with tags. Pushing the tag triggers `.github/workflows/release.yml`, which builds the zip and creates the GitHub release — do NOT `gh release create` manually, it makes the workflow fail with a tag conflict. Always check the Release workflow run is green (`gh run list`) before claiming the release succeeded.
+`npm version patch` (syncs manifest via `scripts/sync-version.mjs`), commit `Release vX.Y.Z`, tag `vX.Y.Z`, push with tags. Pushing the tag triggers `.github/workflows/release.yml`, which builds the Chrome and Firefox zips and creates the GitHub release — do NOT `gh release create` manually, it makes the workflow fail with a tag conflict. Always check the Release workflow run is green (`gh run list`) before claiming the release succeeded.
 
 ## Architecture
 
-MV3 Chrome extension, zero runtime dependencies. Two esbuild entry points: `src/background/index.ts` (service worker) and `src/popup/index.ts`.
+MV3 extension (Chrome + Firefox from one source tree), zero runtime dependencies. Two esbuild entry points: `src/background/index.ts` (service worker on Chrome, event page on Firefox) and `src/popup/index.ts`. `public/manifest.json` is Chrome's and the single source of truth; `scripts/build.mjs --target=firefox` derives the Firefox manifest from it (drops `key`, swaps background to `scripts`, adds `browser_specific_settings.gecko`). Firefox treats `host_permissions` as opt-in, so the popup gates the site list behind a one-time grant card (`checkHostAccess` in `src/popup/index.ts`).
 
 **Adapter ↔ framework split.** Adapters (`src/adapters/`) know one site's backend; the framework (`src/framework/`) owns rate limiting, file delivery, resume, and progress. New sites are one file in `src/adapters/` + entry in `src/adapters/index.ts` + host in `public/manifest.json`. Two kinds in `framework/types.ts`: `kind: 'chat'` returns a `ChatConversation` and the framework renders it uniformly; `kind: 'custom'` returns `{ filename, body }` and owns its own rendering. See `docs/ADAPTER-API.md` for the full contract.
 
